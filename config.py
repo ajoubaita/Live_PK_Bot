@@ -40,6 +40,10 @@ class BotConfig(BaseSettings):
         default=None,
         description="Kalshi API key"
     )
+    kalshi_private_key_file: Optional[str] = Field(
+        default=None,
+        description="Path to Kalshi RSA private key file"
+    )
 
     # Polymarket API Configuration
     polymarket_api_base: str = Field(
@@ -53,6 +57,10 @@ class BotConfig(BaseSettings):
     polymarket_api_key: Optional[str] = Field(
         default=None,
         description="Polymarket API key"
+    )
+    polymarket_private_key: Optional[str] = Field(
+        default=None,
+        description="Polymarket private key"
     )
     polymarket_secret: Optional[str] = Field(
         default=None,

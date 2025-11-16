@@ -34,6 +34,16 @@ class KalshiClient:
         self.is_connected = False
         self._message_handlers: List[Callable] = []
 
+        # Load private key from file if specified
+        self.private_key: Optional[str] = None
+        if self.config.kalshi_private_key_file:
+            try:
+                with open(self.config.kalshi_private_key_file, 'r') as f:
+                    self.private_key = f.read()
+                logger.info("Loaded Kalshi private key from file")
+            except Exception as e:
+                logger.warning(f"Could not load Kalshi private key file: {e}")
+
     async def __aenter__(self):
         """Async context manager entry."""
         await self.connect()
