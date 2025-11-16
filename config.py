@@ -112,6 +112,60 @@ class BotConfig(BaseSettings):
         default=15,
         description="Seconds between heartbeat checks"
     )
+    stale_data_threshold: int = Field(
+        default=30,
+        description="Seconds before considering orderbook data stale"
+    )
+
+    # Fee Configuration
+    kalshi_fee_rate: float = Field(
+        default=0.007,
+        description="Kalshi trading fee rate (0.7%)"
+    )
+    polymarket_fee_rate: float = Field(
+        default=0.02,
+        description="Polymarket trading fee rate (2%)"
+    )
+
+    # Rate Limiting
+    kalshi_rate_limit: float = Field(
+        default=10.0,
+        description="Kalshi API calls per second"
+    )
+    polymarket_rate_limit: float = Field(
+        default=10.0,
+        description="Polymarket API calls per second"
+    )
+
+    # Circuit Breaker
+    circuit_breaker_threshold: int = Field(
+        default=5,
+        description="Failures before circuit breaker opens"
+    )
+    circuit_breaker_timeout: int = Field(
+        default=60,
+        description="Seconds to wait before circuit reset attempt"
+    )
+
+    # Minimum Order Sizes
+    min_order_size_kalshi: int = Field(
+        default=1,
+        description="Minimum order size for Kalshi (shares)"
+    )
+    min_order_size_polymarket: int = Field(
+        default=1,
+        description="Minimum order size for Polymarket (shares)"
+    )
+
+    # Log Rotation
+    log_max_bytes: int = Field(
+        default=10 * 1024 * 1024,  # 10 MB
+        description="Maximum log file size before rotation"
+    )
+    log_backup_count: int = Field(
+        default=5,
+        description="Number of backup log files to keep"
+    )
 
     @validator('log_level')
     def validate_log_level(cls, v):
