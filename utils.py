@@ -357,6 +357,110 @@ async def with_timeout(coro, timeout_seconds: float, default=None):
         return default
 
 
+class PolymarketRateLimiter:
+    """
+    Comprehensive rate limiter for Polymarket API endpoints.
+    Implements all documented rate limits across different API categories.
+    """
+
+    def __init__(self):
+        """Initialize rate limiters for all Polymarket API endpoints."""
+        # General rate limits
+        self.general = RateLimiter(calls_per_second=5000/10, burst=5000)  # 5000 req / 10s
+        self.ok_endpoint = RateLimiter(calls_per_second=50/10, burst=50)  # 50 req / 10s
+
+        # Data API
+        self.data_general = RateLimiter(calls_per_second=200/10, burst=200)  # 200 req / 10s
+        self.data_trades = RateLimiter(calls_per_second=75/10, burst=75)  # 75 req / 10s
+        self.data_ok = RateLimiter(calls_per_second=10/10, burst=10)  # 10 req / 10s
+
+        # GAMMA API
+        self.gamma_general = RateLimiter(calls_per_second=750/10, burst=750)  # 750 req / 10s
+        self.gamma_events = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
+        self.gamma_markets = RateLimiter(calls_per_second=125/10, burst=125)  # 125 req / 10s
+        self.gamma_markets_events = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
+        self.gamma_tags = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
+        self.gamma_search = RateLimiter(calls_per_second=300/10, burst=300)  # 300 req / 10s
+
+        # CLOB Market Data
+        self.clob_book = RateLimiter(calls_per_second=200/10, burst=200)  # 200 req / 10s
+        self.clob_books = RateLimiter(calls_per_second=80/10, burst=80)  # 80 req / 10s
+        self.clob_price = RateLimiter(calls_per_second=200/10, burst=200)  # 200 req / 10s
+        self.clob_prices = RateLimiter(calls_per_second=80/10, burst=80)  # 80 req / 10s
+        self.clob_midprice = RateLimiter(calls_per_second=200/10, burst=200)  # 200 req / 10s
+        self.clob_midprices = RateLimiter(calls_per_second=80/10, burst=80)  # 80 req / 10s
+
+        # CLOB Ledger
+        self.clob_ledger_general = RateLimiter(calls_per_second=300/10, burst=300)  # 300 req / 10s
+        self.clob_data_orders = RateLimiter(calls_per_second=150/10, burst=150)  # 150 req / 10s
+        self.clob_data_trades = RateLimiter(calls_per_second=150/10, burst=150)  # 150 req / 10s
+        self.clob_notifications = RateLimiter(calls_per_second=125/10, burst=125)  # 125 req / 10s
+
+        # CLOB Markets & Pricing
+        self.clob_price_history = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
+        self.clob_markets_list = RateLimiter(calls_per_second=250/10, burst=250)  # 250 req / 10s
+        self.clob_market_detail = RateLimiter(calls_per_second=50/10, burst=50)  # 50 req / 10s
+        self.clob_tick_size = RateLimiter(calls_per_second=50/10, burst=50)  # 50 req / 10s
+        self.clob_markets_listing = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
+
+        # CLOB Trading (burst limits with longer windows)
+        self.clob_order_post = RateLimiter(calls_per_second=2400/10, burst=2400)  # 2400 req / 10s burst
+        self.clob_order_delete = RateLimiter(calls_per_second=2400/10, burst=2400)  # 2400 req / 10s burst
+        self.clob_orders_post = RateLimiter(calls_per_second=800/10, burst=800)  # 800 req / 10s burst
+        self.clob_orders_delete = RateLimiter(calls_per_second=800/10, burst=800)  # 800 req / 10s burst
+        self.clob_cancel_all = RateLimiter(calls_per_second=200/10, burst=200)  # 200 req / 10s
+        self.clob_cancel_market = RateLimiter(calls_per_second=800/10, burst=800)  # 800 req / 10s
+
+        # Other
+        self.relayer_submit = RateLimiter(calls_per_second=15/60, burst=15)  # 15 req / 1 min
+        self.user_pnl = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
+
+    async def acquire_for_endpoint(self, endpoint: str):
+        """
+        Acquire rate limit permission for a specific endpoint.
+
+        Args:
+            endpoint: API endpoint path or category
+        """
+        # Map endpoints to appropriate rate limiters
+        if '/events' in endpoint:
+            await self.gamma_events.acquire()
+        elif '/markets' in endpoint and 'gamma-api' in endpoint:
+            await self.gamma_markets.acquire()
+        elif '/book' in endpoint:
+            if '/books' in endpoint:
+                await self.clob_books.acquire()
+            else:
+                await self.clob_book.acquire()
+        elif '/price' in endpoint:
+            if '/prices' in endpoint:
+                await self.clob_prices.acquire()
+            elif '/midprice' in endpoint:
+                await self.clob_midprices.acquire()
+            else:
+                await self.clob_price.acquire()
+        elif '/trades' in endpoint:
+            if 'data-api' in endpoint:
+                await self.data_trades.acquire()
+            else:
+                await self.clob_data_trades.acquire()
+        elif '/orders' in endpoint:
+            await self.clob_data_orders.acquire()
+        elif '/notifications' in endpoint:
+            await self.clob_notifications.acquire()
+        elif '/search' in endpoint:
+            await self.gamma_search.acquire()
+        elif '/tags' in endpoint:
+            await self.gamma_tags.acquire()
+        elif '/submit' in endpoint:
+            await self.relayer_submit.acquire()
+        elif '/pnl' in endpoint:
+            await self.user_pnl.acquire()
+        else:
+            # Default to general rate limit
+            await self.general.acquire()
+
+
 def format_uptime(seconds: float) -> str:
     """
     Format uptime in human-readable format.

@@ -46,6 +46,40 @@ class ArbitrageEngine:
         self.metrics = metrics
         self.opportunities: List[ArbitrageOpportunity] = []
 
+        # Scan statistics for logging
+        self.scan_stats = {
+            'markets_checked': 0,
+            'markets_skipped_no_data': 0,
+            'markets_skipped_low_spread': 0,
+            'markets_skipped_no_size': 0,
+            'last_summary_time': datetime.utcnow()
+        }
+
+    def _log_scan_summary(self):
+        """Log periodic summary of scan statistics."""
+        now = datetime.utcnow()
+        elapsed = (now - self.scan_stats['last_summary_time']).total_seconds()
+
+        # Log summary every 5 minutes
+        if elapsed >= 300:
+            logger.info(
+                f"Arbitrage Scan Summary (last 5min): "
+                f"Markets checked: {self.scan_stats['markets_checked']}, "
+                f"Skipped (no data): {self.scan_stats['markets_skipped_no_data']}, "
+                f"Skipped (low spread): {self.scan_stats['markets_skipped_low_spread']}, "
+                f"Skipped (no size): {self.scan_stats['markets_skipped_no_size']}, "
+                f"Opportunities found: {self.metrics.opportunities_detected}"
+            )
+
+            # Reset stats
+            self.scan_stats = {
+                'markets_checked': 0,
+                'markets_skipped_no_data': 0,
+                'markets_skipped_low_spread': 0,
+                'markets_skipped_no_size': 0,
+                'last_summary_time': now
+            }
+
     async def scan_for_opportunities(self) -> List[ArbitrageOpportunity]:
         """
         Scan all markets for arbitrage opportunities.
@@ -74,6 +108,17 @@ class ArbitrageEngine:
 
             if opportunities:
                 logger.info(f"Found {len(opportunities)} arbitrage opportunities")
+            else:
+                # Log suspected cause when no opportunities found
+                logger.debug(
+                    f"No arbitrage opportunities found. "
+                    f"Markets checked: {self.scan_stats['markets_checked']}, "
+                    f"Possible reasons: insufficient orderbook data, spreads below threshold ({self.config.min_profit_threshold}), "
+                    f"or no available liquidity"
+                )
+
+            # Log periodic summary
+            self._log_scan_summary()
 
         except Exception as e:
             logger.error(f"Error scanning for opportunities: {e}")
@@ -98,6 +143,8 @@ class ArbitrageEngine:
 
             for market_id in market_ids:
                 try:
+                    self.scan_stats['markets_checked'] += 1
+
                     # Get order books for both outcomes
                     yes_bid, yes_ask = await self.orderbook_manager.get_best_prices(
                         platform, market_id, Outcome.YES
@@ -108,20 +155,24 @@ class ArbitrageEngine:
 
                     # Skip if we don't have complete data
                     if yes_bid is None or no_bid is None:
+                        self.scan_stats['markets_skipped_no_data'] += 1
+                        logger.debug(f"Skipped {platform.value}/{market_id}: Missing bid data")
                         continue
 
                     # Check for arbitrage: Can we buy both YES and NO for < $1.00?
                     # We buy at the ask price, so we need yes_ask + no_ask < 1.0
                     if yes_ask is not None and no_ask is not None:
                         total_cost = yes_ask + no_ask
+                        required_spread = 1.0 - self.config.min_profit_threshold
 
                         # Account for minimum profit threshold
-                        if total_cost < (1.0 - self.config.min_profit_threshold):
+                        if total_cost < required_spread:
                             expected_profit = (1.0 - total_cost)
 
                             # Get the market object
                             market = self.market_discovery.get_market_by_id(market_id, platform)
                             if not market:
+                                logger.debug(f"Skipped {platform.value}/{market_id}: Market not found in discovery")
                                 continue
 
                             # Calculate trade size (use minimum of available sizes)
@@ -142,6 +193,11 @@ class ArbitrageEngine:
                             )
 
                             if trade_size <= 0:
+                                self.scan_stats['markets_skipped_no_size'] += 1
+                                logger.debug(
+                                    f"Skipped {platform.value}/{market_id}: No available size "
+                                    f"(yes_size={yes_size}, no_size={no_size})"
+                                )
                                 continue
 
                             # Create opportunity
@@ -173,6 +229,19 @@ class ArbitrageEngine:
                                 f"Buy YES@{yes_ask:.4f} + NO@{no_ask:.4f} = {total_cost:.4f}, "
                                 f"Profit: ${expected_profit * trade_size:.2f}"
                             )
+                        else:
+                            # Spread too low
+                            self.scan_stats['markets_skipped_low_spread'] += 1
+                            spread = 1.0 - total_cost
+                            logger.debug(
+                                f"Skipped {platform.value}/{market_id}: "
+                                f"Spread {spread:.4f} below threshold {self.config.min_profit_threshold} "
+                                f"(yes_ask={yes_ask:.4f}, no_ask={no_ask:.4f})"
+                            )
+                    else:
+                        # Missing ask prices
+                        self.scan_stats['markets_skipped_no_data'] += 1
+                        logger.debug(f"Skipped {platform.value}/{market_id}: Missing ask data")
 
                 except Exception as e:
                     logger.debug(f"Error checking market {market_id}: {e}")
@@ -196,6 +265,8 @@ class ArbitrageEngine:
             # Iterate through all market pairs
             for pair in self.market_discovery.market_pairs:
                 try:
+                    self.scan_stats['markets_checked'] += 1
+
                     kalshi_market = pair.kalshi_market
                     poly_market = pair.polymarket_market
 
@@ -209,6 +280,11 @@ class ArbitrageEngine:
 
                     # Skip if we don't have complete data
                     if None in [kalshi_yes_bid, kalshi_yes_ask, poly_yes_bid, poly_yes_ask]:
+                        self.scan_stats['markets_skipped_no_data'] += 1
+                        logger.debug(
+                            f"Skipped cross-platform pair {kalshi_market.market_id}/{poly_market.market_id}: "
+                            f"Missing price data"
+                        )
                         continue
 
                     # Strategy 1: Buy on Kalshi, sell on Polymarket
@@ -259,6 +335,21 @@ class ArbitrageEngine:
                                     f"Sell Polymarket YES@{poly_yes_bid:.4f}, "
                                     f"Profit: ${spread * trade_size:.2f}"
                                 )
+                            else:
+                                # No available size
+                                self.scan_stats['markets_skipped_no_size'] += 1
+                                logger.debug(
+                                    f"Skipped cross-platform pair {kalshi_market.market_id}/{poly_market.market_id}: "
+                                    f"No size (kalshi_size={kalshi_size}, poly_size={poly_size})"
+                                )
+                        else:
+                            # Spread too low
+                            self.scan_stats['markets_skipped_low_spread'] += 1
+                            logger.debug(
+                                f"Skipped cross-platform pair {kalshi_market.market_id}/{poly_market.market_id}: "
+                                f"Spread {spread:.4f} below threshold {self.config.min_profit_threshold} "
+                                f"(Buy Kalshi@{kalshi_yes_ask:.4f}, Sell Poly@{poly_yes_bid:.4f})"
+                            )
 
                     # Strategy 2: Buy on Polymarket, sell on Kalshi
                     if poly_yes_ask < kalshi_yes_bid:
@@ -308,6 +399,21 @@ class ArbitrageEngine:
                                     f"Sell Kalshi YES@{kalshi_yes_bid:.4f}, "
                                     f"Profit: ${spread * trade_size:.2f}"
                                 )
+                            else:
+                                # No available size
+                                self.scan_stats['markets_skipped_no_size'] += 1
+                                logger.debug(
+                                    f"Skipped cross-platform pair {kalshi_market.market_id}/{poly_market.market_id}: "
+                                    f"No size (kalshi_size={kalshi_size}, poly_size={poly_size})"
+                                )
+                        else:
+                            # Spread too low
+                            self.scan_stats['markets_skipped_low_spread'] += 1
+                            logger.debug(
+                                f"Skipped cross-platform pair {kalshi_market.market_id}/{poly_market.market_id}: "
+                                f"Spread {spread:.4f} below threshold {self.config.min_profit_threshold} "
+                                f"(Buy Poly@{poly_yes_ask:.4f}, Sell Kalshi@{kalshi_yes_bid:.4f})"
+                            )
 
                 except Exception as e:
                     logger.debug(f"Error checking market pair: {e}")

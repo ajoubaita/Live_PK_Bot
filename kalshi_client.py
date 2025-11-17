@@ -6,7 +6,7 @@ Handles REST API calls and WebSocket connections to Kalshi.
 import asyncio
 import logging
 from typing import List, Dict, Optional, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiohttp
 import websockets
 import json
@@ -31,6 +31,7 @@ class KalshiClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.ws_connection: Optional[websockets.WebSocketClientProtocol] = None
         self.auth_token: Optional[str] = None
+        self.token_expiry: Optional[datetime] = None
         self.is_connected = False
         self._message_handlers: List[Callable] = []
 
@@ -95,6 +96,7 @@ class KalshiClient:
     async def _authenticate(self):
         """
         Authenticate with Kalshi API using email and password.
+        Updates the auth token and expiry time.
         """
         try:
             auth_url = f"{self.base_url}/trade-api/v2/login"
@@ -107,6 +109,9 @@ class KalshiClient:
                 if response.status == 200:
                     data = await response.json()
                     self.auth_token = data.get('token')
+                    # Kalshi tokens typically expire after 24 hours
+                    # Set expiry to 23 hours from now to be safe
+                    self.token_expiry = datetime.utcnow() + timedelta(hours=23)
                     logger.info("Kalshi authentication successful")
                 else:
                     error_text = await response.text()
@@ -115,6 +120,21 @@ class KalshiClient:
         except Exception as e:
             logger.error(f"Error during Kalshi authentication: {e}")
             # Continue without auth - some endpoints may still work
+
+    async def _ensure_auth_token(self):
+        """
+        Ensure we have a valid authentication token.
+        Refreshes the token if it's expired or about to expire.
+        """
+        # Check if token exists and is not expired
+        if self.auth_token and self.token_expiry:
+            time_until_expiry = (self.token_expiry - datetime.utcnow()).total_seconds()
+            if time_until_expiry > 300:  # Token valid for more than 5 minutes
+                return
+
+        # Token is missing, expired, or expiring soon - refresh it
+        logger.info("Refreshing Kalshi authentication token...")
+        await self._authenticate()
 
     def _get_headers(self) -> Dict[str, str]:
         """
@@ -220,73 +240,134 @@ class KalshiClient:
         """
         self._message_handlers.append(handler)
 
+    async def _keepalive_task(self, ws: websockets.WebSocketClientProtocol):
+        """
+        Send periodic pings to keep the WebSocket connection alive.
+
+        Args:
+            ws: Active WebSocket connection
+        """
+        try:
+            while not ws.closed:
+                try:
+                    # Send ping and wait for pong
+                    pong_waiter = await ws.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=10)
+                    logger.debug("Kalshi WebSocket keepalive: ping/pong successful")
+                except asyncio.TimeoutError:
+                    logger.warning("Kalshi WebSocket keepalive: pong timeout")
+                    break
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("Kalshi WebSocket keepalive: connection closed")
+                    break
+
+                # Wait 15 seconds before next ping (as per requirements)
+                await asyncio.sleep(15)
+
+        except Exception as e:
+            logger.error(f"Kalshi keepalive task error: {e}")
+
     async def connect_websocket(self, market_ids: List[str] = None):
         """
         Connect to Kalshi WebSocket feed and subscribe to markets.
+        Ensures authentication token is valid before connecting.
 
         Args:
             market_ids: List of market tickers to subscribe to (None = all)
         """
         reconnect_delay = self.config.reconnect_base_delay
+        reconnect_count = 0
 
         while True:
             try:
-                logger.info("Connecting to Kalshi WebSocket...")
+                # Ensure we have a valid auth token before connecting
+                if self.config.kalshi_email and self.config.kalshi_password:
+                    await self._ensure_auth_token()
 
-                # Connect to WebSocket
+                logger.info(f"Connecting to Kalshi WebSocket (attempt {reconnect_count + 1})...")
+
+                # Connect to WebSocket with auth header
                 extra_headers = {}
                 if self.auth_token:
                     extra_headers["Authorization"] = f"Bearer {self.auth_token}"
+                    logger.debug("Using authenticated WebSocket connection")
+                else:
+                    logger.warning("No auth token available for Kalshi WebSocket")
 
                 async with websockets.connect(
                     self.ws_url,
                     extra_headers=extra_headers if extra_headers else None,
-                    ping_interval=20,
+                    ping_interval=15,  # 15s keepalive as per requirements
                     ping_timeout=10
                 ) as ws:
                     self.ws_connection = ws
-                    logger.info("Kalshi WebSocket connected")
+                    logger.info("Kalshi WebSocket connected successfully")
 
-                    # Subscribe to markets
-                    if market_ids:
-                        subscribe_msg = {
-                            "type": "subscribe",
-                            "channels": [
-                                {
-                                    "name": "orderbook_delta",
-                                    "market_tickers": market_ids
-                                }
-                            ]
-                        }
-                        await ws.send(json.dumps(subscribe_msg))
-                        logger.info(f"Subscribed to {len(market_ids)} Kalshi markets")
+                    # Start keepalive task in background
+                    keepalive_task = asyncio.create_task(self._keepalive_task(ws))
 
-                    # Reset reconnect delay on successful connection
-                    reconnect_delay = self.config.reconnect_base_delay
+                    try:
+                        # Subscribe to markets
+                        if market_ids:
+                            subscribe_msg = {
+                                "type": "subscribe",
+                                "channels": [
+                                    {
+                                        "name": "orderbook_delta",
+                                        "market_tickers": market_ids
+                                    }
+                                ]
+                            }
+                            await ws.send(json.dumps(subscribe_msg))
+                            logger.info(f"Subscribed to {len(market_ids)} Kalshi markets")
 
-                    # Listen for messages
-                    async for message in ws:
+                        # Reset reconnect delay on successful connection
+                        reconnect_delay = self.config.reconnect_base_delay
+                        reconnect_count = 0
+
+                        # Listen for messages
+                        async for message in ws:
+                            try:
+                                data = json.loads(message)
+
+                                # Notify all registered handlers
+                                for handler in self._message_handlers:
+                                    asyncio.create_task(handler(Platform.KALSHI, data))
+
+                            except json.JSONDecodeError:
+                                logger.warning(f"Received invalid JSON from Kalshi: {message}")
+                            except Exception as e:
+                                logger.error(f"Error processing Kalshi WebSocket message: {e}")
+
+                    finally:
+                        # Clean up keepalive task
+                        keepalive_task.cancel()
                         try:
-                            data = json.loads(message)
+                            await keepalive_task
+                        except asyncio.CancelledError:
+                            pass
 
-                            # Notify all registered handlers
-                            for handler in self._message_handlers:
-                                asyncio.create_task(handler(Platform.KALSHI, data))
-
-                        except json.JSONDecodeError:
-                            logger.warning(f"Received invalid JSON from Kalshi: {message}")
-                        except Exception as e:
-                            logger.error(f"Error processing Kalshi WebSocket message: {e}")
-
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("Kalshi WebSocket connection closed")
+            except websockets.exceptions.InvalidStatusCode as e:
+                if e.status_code == 401:
+                    logger.error("Kalshi WebSocket authentication failed (401). Refreshing token...")
+                    # Force token refresh on next attempt
+                    self.auth_token = None
+                    self.token_expiry = None
+                    reconnect_count += 1
+                else:
+                    logger.error(f"Kalshi WebSocket invalid status code: {e.status_code}")
+                    reconnect_count += 1
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"Kalshi WebSocket connection closed: {e}")
+                reconnect_count += 1
             except Exception as e:
-                logger.error(f"Kalshi WebSocket error: {e}")
+                logger.error(f"Kalshi WebSocket error: {e}", exc_info=True)
+                reconnect_count += 1
 
-            # Exponential backoff for reconnection
-            logger.info(f"Reconnecting to Kalshi WebSocket in {reconnect_delay}s...")
+            # Exponential backoff for reconnection (start at 2s, cap at 60 seconds)
+            logger.info(f"Reconnecting to Kalshi WebSocket in {reconnect_delay}s... (attempt {reconnect_count})")
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)  # Cap at 60 seconds
+            reconnect_delay = min(reconnect_delay * 2, 60)
 
     async def subscribe_to_market(self, market_id: str):
         """

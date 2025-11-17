@@ -13,6 +13,7 @@ import json
 
 from config import get_config
 from models import Market, Platform, OrderBook, Outcome
+from utils import PolymarketRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,14 @@ class PolymarketClient:
         self.ws_connection: Optional[websockets.WebSocketClientProtocol] = None
         self.is_connected = False
         self._message_handlers: List[Callable] = []
+        self.rate_limiter = PolymarketRateLimiter()
+
+        # Subscription rotation
+        self.subscription_groups: List[List[str]] = []
+        self.current_group_index: int = 0
+        self.last_rotation_time: Optional[datetime] = None
+        self.rotation_interval: int = 300  # 5 minutes in seconds
+        self.markets_per_group: int = 40  # Subscribe to 40 markets at a time
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -112,6 +121,9 @@ class PolymarketClient:
 
             headers = self._get_headers()
 
+            # Apply rate limiting
+            await self.rate_limiter.acquire_for_endpoint(url)
+
             async with self.session.get(url, headers=headers, params=params) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -179,6 +191,9 @@ class PolymarketClient:
                 "token_id": token_id
             }
             headers = self._get_headers()
+
+            # Apply rate limiting
+            await self.rate_limiter.acquire_for_endpoint(url)
 
             async with self.session.get(url, headers=headers, params=params) as response:
                 if response.status == 200:
@@ -252,6 +267,20 @@ class PolymarketClient:
         logger.info(f"Subscription complete: {successful_subs} successful, {failed_subs} failed out of {len(market_ids)} total")
         return successful_subs
 
+    def _create_subscription_groups(self, market_ids: List[str]):
+        """
+        Create subscription groups for rotation.
+
+        Args:
+            market_ids: Full list of market IDs
+        """
+        self.subscription_groups = []
+        for i in range(0, len(market_ids), self.markets_per_group):
+            group = market_ids[i:i + self.markets_per_group]
+            self.subscription_groups.append(group)
+
+        logger.info(f"Created {len(self.subscription_groups)} subscription groups with {self.markets_per_group} markets each")
+
     async def _keepalive_task(self, ws: websockets.WebSocketClientProtocol):
         """
         Send periodic pings to keep the WebSocket connection alive.
@@ -273,15 +302,61 @@ class PolymarketClient:
                     logger.warning("Polymarket WebSocket keepalive: connection closed")
                     break
 
-                # Wait 20 seconds before next ping
-                await asyncio.sleep(20)
+                # Wait 15 seconds before next ping (as per requirements)
+                await asyncio.sleep(15)
 
         except Exception as e:
             logger.error(f"Polymarket keepalive task error: {e}")
 
+    async def _rotation_task(self, ws: websockets.WebSocketClientProtocol):
+        """
+        Rotate subscriptions between market groups.
+
+        Args:
+            ws: Active WebSocket connection
+        """
+        try:
+            while not ws.closed:
+                # Wait for rotation interval
+                await asyncio.sleep(self.rotation_interval)
+
+                if not self.subscription_groups or ws.closed:
+                    break
+
+                # Unsubscribe from current group
+                current_group = self.subscription_groups[self.current_group_index]
+                for market_id in current_group:
+                    try:
+                        unsubscribe_msg = {
+                            "type": "unsubscribe",
+                            "channel": "market",
+                            "market": market_id
+                        }
+                        await ws.send(json.dumps(unsubscribe_msg))
+                    except Exception as e:
+                        logger.debug(f"Error unsubscribing from {market_id}: {e}")
+
+                # Move to next group
+                self.current_group_index = (self.current_group_index + 1) % len(self.subscription_groups)
+                next_group = self.subscription_groups[self.current_group_index]
+
+                logger.info(f"Rotating subscriptions: group {self.current_group_index + 1}/{len(self.subscription_groups)} ({len(next_group)} markets)")
+
+                # Subscribe to next group
+                successful = await self._subscribe_with_throttling(ws, next_group)
+                self.last_rotation_time = datetime.utcnow()
+
+                logger.info(f"Subscription rotation complete: {successful}/{len(next_group)} successful")
+
+        except asyncio.CancelledError:
+            # Normal cancellation
+            pass
+        except Exception as e:
+            logger.error(f"Polymarket rotation task error: {e}")
+
     async def connect_websocket(self, market_ids: List[str] = None):
         """
-        Connect to Polymarket WebSocket feed and subscribe to markets.
+        Connect to Polymarket WebSocket feed and subscribe to markets with rotation.
 
         Args:
             market_ids: List of market/token IDs to subscribe to (None = all)
@@ -289,13 +364,20 @@ class PolymarketClient:
         reconnect_delay = self.config.reconnect_base_delay
         reconnect_count = 0
 
+        # Create subscription groups if market IDs provided
+        if market_ids and len(market_ids) > self.markets_per_group:
+            self._create_subscription_groups(market_ids)
+            initial_subscription = self.subscription_groups[0] if self.subscription_groups else market_ids
+        else:
+            initial_subscription = market_ids
+
         while True:
             try:
                 logger.info(f"Connecting to Polymarket WebSocket (attempt {reconnect_count + 1})...")
 
                 async with websockets.connect(
                     self.ws_url,
-                    ping_interval=20,
+                    ping_interval=15,  # 15s keepalive as per requirements
                     ping_timeout=10
                 ) as ws:
                     self.ws_connection = ws
@@ -304,17 +386,28 @@ class PolymarketClient:
                     # Start keepalive task in background
                     keepalive_task = asyncio.create_task(self._keepalive_task(ws))
 
+                    # Start rotation task if using groups
+                    rotation_task = None
+                    if self.subscription_groups:
+                        rotation_task = asyncio.create_task(self._rotation_task(ws))
+
                     try:
-                        # Subscribe to markets with throttling
-                        if market_ids:
-                            successful_subs = await self._subscribe_with_throttling(ws, market_ids)
+                        # Subscribe to initial markets with throttling
+                        if initial_subscription:
+                            successful_subs = await self._subscribe_with_throttling(ws, initial_subscription)
 
                             if successful_subs == 0:
                                 logger.error("Failed to subscribe to any markets, will reconnect")
                                 keepalive_task.cancel()
+                                if rotation_task:
+                                    rotation_task.cancel()
                                 continue
 
-                            logger.info(f"Successfully subscribed to {successful_subs}/{len(market_ids)} Polymarket markets")
+                            if self.subscription_groups:
+                                logger.info(f"Successfully subscribed to {successful_subs}/{len(initial_subscription)} markets (group 1/{len(self.subscription_groups)})")
+                                self.last_rotation_time = datetime.utcnow()
+                            else:
+                                logger.info(f"Successfully subscribed to {successful_subs}/{len(initial_subscription)} Polymarket markets")
                         else:
                             logger.info("No specific markets to subscribe to, listening to all updates")
 
@@ -337,10 +430,14 @@ class PolymarketClient:
                                 logger.error(f"Error processing Polymarket WebSocket message: {e}")
 
                     finally:
-                        # Clean up keepalive task
+                        # Clean up tasks
                         keepalive_task.cancel()
+                        if rotation_task:
+                            rotation_task.cancel()
                         try:
                             await keepalive_task
+                            if rotation_task:
+                                await rotation_task
                         except asyncio.CancelledError:
                             pass
 
@@ -351,10 +448,10 @@ class PolymarketClient:
                 logger.error(f"Polymarket WebSocket error: {e}", exc_info=True)
                 reconnect_count += 1
 
-            # Exponential backoff for reconnection (cap at 120 seconds)
+            # Exponential backoff for reconnection (start at 2s, cap at 60s as per requirements)
             logger.info(f"Reconnecting to Polymarket WebSocket in {reconnect_delay}s... (attempt {reconnect_count})")
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 120)
+            reconnect_delay = min(reconnect_delay * 2, 60)
 
     async def subscribe_to_market(self, market_id: str):
         """
