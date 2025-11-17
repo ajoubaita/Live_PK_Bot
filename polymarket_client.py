@@ -40,7 +40,7 @@ class PolymarketClient:
         self.current_group_index: int = 0
         self.last_rotation_time: Optional[datetime] = None
         self.rotation_interval: int = 300  # 5 minutes in seconds
-        self.markets_per_group: int = 40  # Subscribe to 40 markets at a time
+        self.markets_per_group: int = 20  # Subscribe to 20 markets at a time (reduced for stability)
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -260,9 +260,10 @@ class PolymarketClient:
                 # Continue with next market instead of breaking
                 continue
 
-            # Throttle: Wait 0.25 seconds between each subscription
+            # Throttle: Wait 1.0 second between each subscription
+            # Slower throttle prevents overwhelming the WebSocket server
             if i < len(market_ids):  # Don't wait after the last one
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(1.0)
 
         logger.info(f"Subscription complete: {successful_subs} successful, {failed_subs} failed out of {len(market_ids)} total")
         return successful_subs
@@ -381,7 +382,12 @@ class PolymarketClient:
                     ping_timeout=10
                 ) as ws:
                     self.ws_connection = ws
-                    logger.info("Polymarket WebSocket connected successfully")
+                    logger.info("Polymarket WebSocket connected, waiting for handshake completion...")
+
+                    # CRITICAL FIX: Wait for WebSocket handshake to complete
+                    # This prevents "no close frame received or sent" errors
+                    await asyncio.sleep(2.0)
+                    logger.info("WebSocket handshake complete, ready for subscriptions")
 
                     # Start keepalive task in background
                     keepalive_task = asyncio.create_task(self._keepalive_task(ws))
