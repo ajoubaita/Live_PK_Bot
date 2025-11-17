@@ -95,31 +95,41 @@ class KalshiClient:
 
     async def _authenticate(self):
         """
-        Authenticate with Kalshi API using email and password.
-        Updates the auth token and expiry time.
+        Authenticate with Kalshi API.
+        Uses API key authentication instead of deprecated email/password login.
         """
         try:
-            auth_url = f"{self.base_url}/trade-api/v2/login"
-            payload = {
-                "email": self.config.kalshi_email,
-                "password": self.config.kalshi_password
-            }
+            # Try email/password login if provided (legacy, may not work)
+            if self.config.kalshi_email and self.config.kalshi_password:
+                try:
+                    auth_url = f"{self.base_url}/trade-api/v2/login"
+                    payload = {
+                        "email": self.config.kalshi_email,
+                        "password": self.config.kalshi_password
+                    }
 
-            async with self.session.post(auth_url, json=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    self.auth_token = data.get('token')
-                    # Kalshi tokens typically expire after 24 hours
-                    # Set expiry to 23 hours from now to be safe
-                    self.token_expiry = datetime.utcnow() + timedelta(hours=23)
-                    logger.info("Kalshi authentication successful")
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Kalshi authentication failed: {response.status} - {error_text}")
+                    async with self.session.post(auth_url, json=payload) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self.auth_token = data.get('token')
+                            self.token_expiry = datetime.utcnow() + timedelta(hours=23)
+                            logger.info("Kalshi email/password authentication successful")
+                            return
+                        else:
+                            logger.warning(f"Kalshi login endpoint returned {response.status}, falling back to API key auth")
+                except Exception as e:
+                    logger.warning(f"Kalshi login failed ({e}), using API key authentication instead")
+
+            # Use API key authentication (preferred method)
+            if self.config.kalshi_api_key:
+                logger.info("Using Kalshi API key authentication for data access")
+                # API key will be used in headers for each request
+                # No need to obtain a token
+            else:
+                logger.warning("No Kalshi authentication credentials available")
 
         except Exception as e:
             logger.error(f"Error during Kalshi authentication: {e}")
-            # Continue without auth - some endpoints may still work
 
     async def _ensure_auth_token(self):
         """
@@ -270,7 +280,7 @@ class KalshiClient:
     async def connect_websocket(self, market_ids: List[str] = None):
         """
         Connect to Kalshi WebSocket feed and subscribe to markets.
-        Ensures authentication token is valid before connecting.
+        Uses API key authentication for data access.
 
         Args:
             market_ids: List of market tickers to subscribe to (None = all)
@@ -280,19 +290,21 @@ class KalshiClient:
 
         while True:
             try:
-                # Ensure we have a valid auth token before connecting
-                if self.config.kalshi_email and self.config.kalshi_password:
-                    await self._ensure_auth_token()
-
                 logger.info(f"Connecting to Kalshi WebSocket (attempt {reconnect_count + 1})...")
 
-                # Connect to WebSocket with auth header
+                # Build auth headers for WebSocket
                 extra_headers = {}
+
+                # Try to use existing token first
                 if self.auth_token:
                     extra_headers["Authorization"] = f"Bearer {self.auth_token}"
-                    logger.debug("Using authenticated WebSocket connection")
+                    logger.debug("Using token-based WebSocket authentication")
+                # Fall back to API key if available
+                elif self.config.kalshi_api_key:
+                    extra_headers["X-API-Key"] = self.config.kalshi_api_key
+                    logger.debug("Using API key for WebSocket authentication")
                 else:
-                    logger.warning("No auth token available for Kalshi WebSocket")
+                    logger.warning("No Kalshi authentication available - connection may be limited to public data")
 
                 async with websockets.connect(
                     self.ws_url,
