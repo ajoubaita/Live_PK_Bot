@@ -201,6 +201,84 @@ class PolymarketClient:
         """
         self._message_handlers.append(handler)
 
+    async def _subscribe_with_throttling(self, ws: websockets.WebSocketClientProtocol, market_ids: List[str]) -> int:
+        """
+        Subscribe to markets with throttling to prevent overwhelming the WebSocket.
+
+        Args:
+            ws: Active WebSocket connection
+            market_ids: List of market IDs to subscribe to
+
+        Returns:
+            Number of successful subscriptions
+        """
+        successful_subs = 0
+        failed_subs = 0
+
+        logger.info(f"Starting throttled subscription to {len(market_ids)} Polymarket markets...")
+
+        for i, market_id in enumerate(market_ids, 1):
+            # Check if connection is still open before attempting
+            if ws.closed:
+                logger.warning(f"WebSocket closed during subscription at {i}/{len(market_ids)}")
+                break
+
+            try:
+                subscribe_msg = {
+                    "type": "subscribe",
+                    "channel": "market",
+                    "market": market_id
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                successful_subs += 1
+
+                # Log progress every 100 subscriptions
+                if i % 100 == 0:
+                    logger.info(f"Subscription progress: {i}/{len(market_ids)} ({successful_subs} successful, {failed_subs} failed)")
+
+            except websockets.exceptions.ConnectionClosed:
+                logger.error(f"Connection closed while subscribing to market {market_id} ({i}/{len(market_ids)})")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to subscribe to market {market_id}: {e}")
+                failed_subs += 1
+                # Continue with next market instead of breaking
+                continue
+
+            # Throttle: Wait 0.25 seconds between each subscription
+            if i < len(market_ids):  # Don't wait after the last one
+                await asyncio.sleep(0.25)
+
+        logger.info(f"Subscription complete: {successful_subs} successful, {failed_subs} failed out of {len(market_ids)} total")
+        return successful_subs
+
+    async def _keepalive_task(self, ws: websockets.WebSocketClientProtocol):
+        """
+        Send periodic pings to keep the WebSocket connection alive.
+
+        Args:
+            ws: Active WebSocket connection
+        """
+        try:
+            while not ws.closed:
+                try:
+                    # Send ping and wait for pong
+                    pong_waiter = await ws.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=10)
+                    logger.debug("Polymarket WebSocket keepalive: ping/pong successful")
+                except asyncio.TimeoutError:
+                    logger.warning("Polymarket WebSocket keepalive: pong timeout")
+                    break
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("Polymarket WebSocket keepalive: connection closed")
+                    break
+
+                # Wait 20 seconds before next ping
+                await asyncio.sleep(20)
+
+        except Exception as e:
+            logger.error(f"Polymarket keepalive task error: {e}")
+
     async def connect_websocket(self, market_ids: List[str] = None):
         """
         Connect to Polymarket WebSocket feed and subscribe to markets.
@@ -209,10 +287,11 @@ class PolymarketClient:
             market_ids: List of market/token IDs to subscribe to (None = all)
         """
         reconnect_delay = self.config.reconnect_base_delay
+        reconnect_count = 0
 
         while True:
             try:
-                logger.info("Connecting to Polymarket WebSocket...")
+                logger.info(f"Connecting to Polymarket WebSocket (attempt {reconnect_count + 1})...")
 
                 async with websockets.connect(
                     self.ws_url,
@@ -220,46 +299,62 @@ class PolymarketClient:
                     ping_timeout=10
                 ) as ws:
                     self.ws_connection = ws
-                    logger.info("Polymarket WebSocket connected")
+                    logger.info("Polymarket WebSocket connected successfully")
 
-                    # Subscribe to markets
-                    if market_ids:
-                        for market_id in market_ids:
-                            subscribe_msg = {
-                                "type": "subscribe",
-                                "channel": "market",
-                                "market": market_id
-                            }
-                            await ws.send(json.dumps(subscribe_msg))
+                    # Start keepalive task in background
+                    keepalive_task = asyncio.create_task(self._keepalive_task(ws))
 
-                        logger.info(f"Subscribed to {len(market_ids)} Polymarket markets")
+                    try:
+                        # Subscribe to markets with throttling
+                        if market_ids:
+                            successful_subs = await self._subscribe_with_throttling(ws, market_ids)
 
-                    # Reset reconnect delay on successful connection
-                    reconnect_delay = self.config.reconnect_base_delay
+                            if successful_subs == 0:
+                                logger.error("Failed to subscribe to any markets, will reconnect")
+                                keepalive_task.cancel()
+                                continue
 
-                    # Listen for messages
-                    async for message in ws:
+                            logger.info(f"Successfully subscribed to {successful_subs}/{len(market_ids)} Polymarket markets")
+                        else:
+                            logger.info("No specific markets to subscribe to, listening to all updates")
+
+                        # Reset reconnect delay on successful connection and subscription
+                        reconnect_delay = self.config.reconnect_base_delay
+                        reconnect_count = 0
+
+                        # Listen for messages
+                        async for message in ws:
+                            try:
+                                data = json.loads(message)
+
+                                # Notify all registered handlers
+                                for handler in self._message_handlers:
+                                    asyncio.create_task(handler(Platform.POLYMARKET, data))
+
+                            except json.JSONDecodeError:
+                                logger.warning(f"Received invalid JSON from Polymarket: {message}")
+                            except Exception as e:
+                                logger.error(f"Error processing Polymarket WebSocket message: {e}")
+
+                    finally:
+                        # Clean up keepalive task
+                        keepalive_task.cancel()
                         try:
-                            data = json.loads(message)
+                            await keepalive_task
+                        except asyncio.CancelledError:
+                            pass
 
-                            # Notify all registered handlers
-                            for handler in self._message_handlers:
-                                asyncio.create_task(handler(Platform.POLYMARKET, data))
-
-                        except json.JSONDecodeError:
-                            logger.warning(f"Received invalid JSON from Polymarket: {message}")
-                        except Exception as e:
-                            logger.error(f"Error processing Polymarket WebSocket message: {e}")
-
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("Polymarket WebSocket connection closed")
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"Polymarket WebSocket connection closed: {e}")
+                reconnect_count += 1
             except Exception as e:
-                logger.error(f"Polymarket WebSocket error: {e}")
+                logger.error(f"Polymarket WebSocket error: {e}", exc_info=True)
+                reconnect_count += 1
 
-            # Exponential backoff for reconnection
-            logger.info(f"Reconnecting to Polymarket WebSocket in {reconnect_delay}s...")
+            # Exponential backoff for reconnection (cap at 120 seconds)
+            logger.info(f"Reconnecting to Polymarket WebSocket in {reconnect_delay}s... (attempt {reconnect_count})")
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)  # Cap at 60 seconds
+            reconnect_delay = min(reconnect_delay * 2, 120)
 
     async def subscribe_to_market(self, market_id: str):
         """
