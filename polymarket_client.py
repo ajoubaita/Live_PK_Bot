@@ -363,131 +363,124 @@ class PolymarketClient:
 
     def _handle_subscription_ack(self, message: dict):
         """
-        Handle subscription acknowledgment messages from Polymarket WebSocket.
+        Handle subscription confirmation via book updates from Polymarket WebSocket.
+
+        Polymarket doesn't send explicit ACKs - instead, they immediately start
+        sending "book" events for subscribed assets.
 
         Args:
             message: WebSocket message data
         """
         try:
-            # Polymarket sends different message types
-            # Check for subscription confirmation or market data (which implies subscription success)
-            msg_type = message.get('type', '')
-            market_id = message.get('market', '') or message.get('asset_id', '')
+            # Polymarket sends book updates as confirmation
+            # Message format: {"event_type": "book", "asset_id": "...", ...}
+            event_type = message.get('event_type', '')
+            asset_id = message.get('asset_id', '')
 
-            # If we receive market data for a pending subscription, mark as subscribed
-            if market_id and market_id in self.pending_subscriptions:
-                self.subscribed_markets.add(market_id)
-                self.pending_subscriptions.discard(market_id)
-                logger.debug(f"Confirmed subscription to market {market_id} via {msg_type} message")
-
-            # Handle explicit subscription acknowledgment (if Polymarket sends one)
-            if msg_type == 'subscribed' and market_id:
-                self.subscribed_markets.add(market_id)
-                self.pending_subscriptions.discard(market_id)
-                logger.info(f"Received explicit subscription confirmation for market {market_id}")
+            # Any message with asset_id confirms that asset is subscribed
+            if asset_id:
+                # If this is a pending subscription, mark as confirmed
+                if asset_id in self.pending_subscriptions:
+                    self.subscribed_markets.add(asset_id)
+                    self.pending_subscriptions.discard(asset_id)
+                    logger.debug(f"Confirmed subscription to asset {asset_id} via '{event_type}' event")
+                # Even if not pending, track it as subscribed (might be from previous session)
+                elif asset_id not in self.subscribed_markets:
+                    self.subscribed_markets.add(asset_id)
+                    logger.debug(f"Received data for asset {asset_id}, marking as subscribed")
 
         except Exception as e:
-            logger.debug(f"Error handling subscription ack: {e}")
+            logger.debug(f"Error handling subscription confirmation: {e}")
 
-    async def _subscribe_with_throttling(self, ws: websockets.WebSocketClientProtocol, market_ids: List[str], max_retries: int = 3) -> int:
+    async def _subscribe_with_batching(self, ws: websockets.WebSocketClientProtocol, market_ids: List[str], batch_size: int = 20) -> int:
         """
-        Subscribe to markets with throttling, retry logic, and acknowledgment tracking.
+        Subscribe to markets using Polymarket's correct format with batching.
+
+        Polymarket WebSocket expects:
+        {
+            "assets_ids": ["token_id1", "token_id2", ...],
+            "type": "market"
+        }
 
         Args:
             ws: Active WebSocket connection
-            market_ids: List of market IDs to subscribe to
-            max_retries: Maximum retry attempts per market (default 3)
+            market_ids: List of token IDs to subscribe to
+            batch_size: Number of markets per subscription batch (default 20)
 
         Returns:
-            Number of successful subscriptions
+            Number of markets subscribed
         """
-        successful_subs = 0
-        failed_subs = 0
+        if not market_ids:
+            logger.warning("No market IDs provided for subscription")
+            return 0
 
-        logger.info(f"Starting throttled subscription to {len(market_ids)} Polymarket markets (max {max_retries} retries per market)...")
+        logger.info(f"Subscribing to {len(market_ids)} Polymarket markets using batched subscription (batch size: {batch_size})...")
 
-        for i, market_id in enumerate(market_ids, 1):
-            # Check if connection is still open before attempting
+        # Extract token IDs from market IDs (market_id might be conditionId, we need tokenID)
+        # For Polymarket, we'll use the market_ids as-is since they should be token IDs
+        total_subscribed = 0
+
+        # Split into batches
+        for batch_start in range(0, len(market_ids), batch_size):
+            batch = market_ids[batch_start:batch_start + batch_size]
+            batch_num = (batch_start // batch_size) + 1
+            total_batches = (len(market_ids) + batch_size - 1) // batch_size
+
+            # Check if connection is still open
             if ws.closed:
-                logger.warning(f"WebSocket closed during subscription at {i}/{len(market_ids)}")
+                logger.error(f"WebSocket closed during subscription at batch {batch_num}/{total_batches}")
                 break
 
-            # Check if already subscribed
-            if market_id in self.subscribed_markets:
-                logger.debug(f"Market {market_id} already subscribed, skipping")
-                successful_subs += 1
-                continue
+            try:
+                # Use Polymarket's documented format
+                subscribe_msg = {
+                    "assets_ids": batch,  # Array of token IDs
+                    "type": "market"      # Channel type
+                }
 
-            # Attempt subscription with retries
-            retry_count = 0
-            subscribed = False
+                logger.info(f"Sending subscription batch {batch_num}/{total_batches} ({len(batch)} markets)")
+                logger.debug(f"Subscription payload: {json.dumps(subscribe_msg)}")
 
-            while retry_count <= max_retries and not subscribed:
-                try:
-                    subscribe_msg = {
-                        "type": "subscribe",
-                        "channel": "market",
-                        "market": market_id
-                    }
+                # Send subscription message
+                await ws.send(json.dumps(subscribe_msg))
 
-                    # Track as pending
+                # Track all markets in this batch as pending
+                for market_id in batch:
                     self.pending_subscriptions.add(market_id)
 
-                    # Send subscription request
-                    await ws.send(json.dumps(subscribe_msg))
+                # Wait for first messages to arrive (Polymarket sends book updates, not ACKs)
+                await asyncio.sleep(2.0)
 
-                    # Wait for acknowledgment (give it 2 seconds)
-                    await asyncio.sleep(2.0)
-
-                    # Check if we received confirmation (will be removed from pending in message handler)
+                # Count how many we got confirmations for
+                confirmed_in_batch = 0
+                for market_id in batch:
                     if market_id in self.subscribed_markets:
-                        successful_subs += 1
-                        subscribed = True
-                        logger.debug(f"Successfully subscribed to market {market_id} on attempt {retry_count + 1}")
-                    elif retry_count < max_retries:
-                        # No confirmation yet, retry
-                        retry_count += 1
-                        logger.warning(f"No acknowledgment for market {market_id}, retry {retry_count}/{max_retries}")
-                        self.pending_subscriptions.discard(market_id)
-                        await asyncio.sleep(1.0)  # Wait before retry
-                    else:
-                        # Max retries exceeded
-                        logger.error(f"Failed to subscribe to market {market_id} after {max_retries} attempts")
-                        self.pending_subscriptions.discard(market_id)
-                        self.failed_subscriptions[market_id] = retry_count
-                        failed_subs += 1
+                        confirmed_in_batch += 1
 
-                except websockets.exceptions.ConnectionClosed:
-                    logger.error(f"Connection closed while subscribing to market {market_id} ({i}/{len(market_ids)})")
-                    self.pending_subscriptions.discard(market_id)
-                    break
-                except Exception as e:
-                    logger.warning(f"Error subscribing to market {market_id} (attempt {retry_count + 1}): {e}")
-                    self.pending_subscriptions.discard(market_id)
-                    if retry_count >= max_retries:
-                        failed_subs += 1
-                        self.failed_subscriptions[market_id] = retry_count
-                        break
-                    retry_count += 1
-                    await asyncio.sleep(1.0)
-
-            # Log progress every 10 subscriptions
-            if i % 10 == 0:
+                total_subscribed += len(batch)  # Consider all sent as subscribed
                 logger.info(
-                    f"Subscription progress: {i}/{len(market_ids)} "
-                    f"({successful_subs} successful, {failed_subs} failed, "
-                    f"{len(self.pending_subscriptions)} pending)"
+                    f"Batch {batch_num}/{total_batches} sent ({len(batch)} markets). "
+                    f"Received data for {confirmed_in_batch} markets so far. "
+                    f"Total: {total_subscribed}/{len(market_ids)}"
                 )
 
-            # Throttle: Wait between subscription attempts
-            if i < len(market_ids):
-                await asyncio.sleep(0.5)  # Reduced to 0.5s since we now have 2s confirmation wait
+                # Throttle between batches (not too aggressive)
+                if batch_start + batch_size < len(market_ids):
+                    await asyncio.sleep(1.0)
+
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.error(f"WebSocket closed during subscription: code={e.code}, reason={e.reason}")
+                break
+            except Exception as e:
+                logger.error(f"Error sending subscription batch {batch_num}: {e}", exc_info=True)
+                # Continue with next batch
+                continue
 
         logger.info(
-            f"Subscription complete: {successful_subs} successful, {failed_subs} failed out of {len(market_ids)} total. "
-            f"Subscribed markets: {len(self.subscribed_markets)}"
+            f"Subscription complete: sent {total_subscribed} markets in {total_batches} batches. "
+            f"Confirmed via messages: {len(self.subscribed_markets)}"
         )
-        return successful_subs
+        return total_subscribed
 
     def _create_subscription_groups(self, market_ids: List[str]):
         """
@@ -564,11 +557,11 @@ class PolymarketClient:
 
                 logger.info(f"Rotating subscriptions: group {self.current_group_index + 1}/{len(self.subscription_groups)} ({len(next_group)} markets)")
 
-                # Subscribe to next group
-                successful = await self._subscribe_with_throttling(ws, next_group)
+                # Subscribe to next group using batched subscription
+                successful = await self._subscribe_with_batching(ws, next_group, batch_size=20)
                 self.last_rotation_time = datetime.utcnow()
 
-                logger.info(f"Subscription rotation complete: {successful}/{len(next_group)} successful")
+                logger.info(f"Subscription rotation complete: {successful} markets subscribed")
 
         except asyncio.CancelledError:
             # Normal cancellation
@@ -619,22 +612,23 @@ class PolymarketClient:
                         rotation_task = asyncio.create_task(self._rotation_task(ws))
 
                     try:
-                        # Subscribe to initial markets with throttling
+                        # Subscribe to initial markets using correct Polymarket format
                         if initial_subscription:
-                            successful_subs = await self._subscribe_with_throttling(ws, initial_subscription)
+                            # Use batched subscription with Polymarket's documented format
+                            successful_subs = await self._subscribe_with_batching(ws, initial_subscription, batch_size=20)
 
                             if successful_subs == 0:
-                                logger.error("Failed to subscribe to any markets, will reconnect")
+                                logger.error("Failed to send any subscription batches, will reconnect")
                                 keepalive_task.cancel()
                                 if rotation_task:
                                     rotation_task.cancel()
                                 continue
 
                             if self.subscription_groups:
-                                logger.info(f"Successfully subscribed to {successful_subs}/{len(initial_subscription)} markets (group 1/{len(self.subscription_groups)})")
+                                logger.info(f"Subscribed to {successful_subs} markets in group 1/{len(self.subscription_groups)}")
                                 self.last_rotation_time = datetime.utcnow()
                             else:
-                                logger.info(f"Successfully subscribed to {successful_subs}/{len(initial_subscription)} Polymarket markets")
+                                logger.info(f"Subscribed to {successful_subs} Polymarket markets")
                         else:
                             logger.info("No specific markets to subscribe to, listening to all updates")
 
@@ -672,7 +666,11 @@ class PolymarketClient:
                             pass
 
             except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"Polymarket WebSocket connection closed: {e}")
+                logger.warning(
+                    f"Polymarket WebSocket connection closed: "
+                    f"code={e.code}, reason={e.reason or 'no reason provided'}"
+                )
+                logger.debug(f"Close details: rcvd={e.rcvd}, sent={e.sent}")
                 reconnect_count += 1
             except Exception as e:
                 logger.error(f"Polymarket WebSocket error: {e}", exc_info=True)
@@ -683,25 +681,25 @@ class PolymarketClient:
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
 
-    async def subscribe_to_market(self, market_id: str):
+    async def subscribe_to_market(self, token_id: str):
         """
-        Subscribe to a specific market's updates via WebSocket.
+        Subscribe to a specific market's updates via WebSocket using Polymarket's format.
 
         Args:
-            market_id: The market/token ID to subscribe to
+            token_id: The market token ID to subscribe to
         """
         if not self.ws_connection or self.ws_connection.closed:
-            logger.warning(f"Cannot subscribe to {market_id}: WebSocket not connected")
+            logger.warning(f"Cannot subscribe to {token_id}: WebSocket not connected")
             return
 
         try:
+            # Use Polymarket's documented format: {"assets_ids": [...], "type": "market"}
             subscribe_msg = {
-                "type": "subscribe",
-                "channel": "market",
-                "market": market_id
+                "assets_ids": [token_id],
+                "type": "market"
             }
             await self.ws_connection.send(json.dumps(subscribe_msg))
-            logger.debug(f"Subscribed to Polymarket market: {market_id}")
+            logger.debug(f"Subscribed to Polymarket token: {token_id}")
 
         except Exception as e:
-            logger.error(f"Error subscribing to Polymarket market {market_id}: {e}")
+            logger.error(f"Error subscribing to Polymarket token {token_id}: {e}")

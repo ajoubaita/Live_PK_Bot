@@ -201,15 +201,23 @@ class BotSupervisor:
 
             # Start WebSocket feeds with quality-filtered markets
             kalshi_market_ids = [m.market_id for m in list(kalshi_markets)[:max_markets]]
-            polymarket_market_ids = [m.market_id for m in high_quality_poly_markets]
 
-            logger.info(f"Starting WebSocket feeds: {len(kalshi_market_ids)} Kalshi, {len(polymarket_market_ids)} Polymarket")
+            # For Polymarket, extract token IDs (not condition IDs) for WebSocket subscription
+            polymarket_token_ids = []
+            for m in high_quality_poly_markets:
+                token_id = m.metadata.get('token_id')
+                if token_id:
+                    polymarket_token_ids.append(token_id)
+                else:
+                    logger.warning(f"Market {m.market_id} has no token_id, skipping WebSocket subscription")
+
+            logger.info(f"Starting WebSocket feeds: {len(kalshi_market_ids)} Kalshi, {len(polymarket_token_ids)} Polymarket (token IDs)")
 
             kalshi_ws_task = asyncio.create_task(
                 self.kalshi_client.connect_websocket(kalshi_market_ids)
             )
             polymarket_ws_task = asyncio.create_task(
-                self.polymarket_client.connect_websocket(polymarket_market_ids)
+                self.polymarket_client.connect_websocket(polymarket_token_ids)
             )
 
             self.tasks.extend([kalshi_ws_task, polymarket_ws_task])
