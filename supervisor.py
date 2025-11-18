@@ -174,9 +174,10 @@ class BotSupervisor:
             polymarket_markets = self.market_discovery.polymarket_markets.values()
 
             # Filter Polymarket markets by quality score (top markets only)
+            # LOWERED to 20 to accept more markets (was 30)
             high_quality_poly_markets = [
                 m for m in polymarket_markets
-                if m.metadata.get('quality_score', 0) >= 30  # Minimum quality score threshold
+                if m.metadata.get('quality_score', 0) >= 20  # Minimum quality score threshold
             ]
 
             # Sort by quality and limit
@@ -187,7 +188,7 @@ class BotSupervisor:
             max_markets = self.config.__dict__.get('max_markets_per_platform', 50)
             high_quality_poly_markets = high_quality_poly_markets[:max_markets]
 
-            logger.info(f"Selected {len(high_quality_poly_markets)} high-quality Polymarket markets (quality >= 30)")
+            logger.info(f"Selected {len(high_quality_poly_markets)} high-quality Polymarket markets (quality >= 20)")
 
             # Initialize orderbooks ONLY for markets we're subscribing to
             markets_to_track = list(kalshi_markets)[:max_markets] + high_quality_poly_markets

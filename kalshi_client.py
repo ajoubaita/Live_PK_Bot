@@ -288,6 +288,18 @@ class KalshiClient:
         reconnect_delay = self.config.reconnect_base_delay
         reconnect_count = 0
 
+        # Ensure we have authentication before attempting WebSocket
+        if not self.auth_token:
+            logger.info("No Kalshi token available, attempting authentication before WebSocket connection...")
+            try:
+                await self._authenticate()
+                if self.auth_token:
+                    logger.info("Successfully obtained Kalshi authentication token for WebSocket")
+                else:
+                    logger.warning("Failed to obtain Kalshi token - WebSocket connection may fail")
+            except Exception as auth_error:
+                logger.error(f"Error during initial Kalshi authentication: {auth_error}")
+
         while True:
             try:
                 logger.info(f"Connecting to Kalshi WebSocket (attempt {reconnect_count + 1})...")
@@ -361,10 +373,16 @@ class KalshiClient:
 
             except websockets.exceptions.InvalidStatusCode as e:
                 if e.status_code == 401:
-                    logger.error("Kalshi WebSocket authentication failed (401). Refreshing token...")
-                    # Force token refresh on next attempt
-                    self.auth_token = None
-                    self.token_expiry = None
+                    logger.error("Kalshi WebSocket authentication failed (401). Attempting to obtain new token...")
+                    # Force token refresh by calling authenticate
+                    try:
+                        await self._authenticate()
+                        if self.auth_token:
+                            logger.info("Successfully obtained new Kalshi authentication token")
+                        else:
+                            logger.warning("Failed to obtain Kalshi token - WebSocket may not work")
+                    except Exception as auth_error:
+                        logger.error(f"Error during Kalshi authentication: {auth_error}")
                     reconnect_count += 1
                 else:
                     logger.error(f"Kalshi WebSocket invalid status code: {e.status_code}")

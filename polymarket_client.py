@@ -169,24 +169,37 @@ class PolymarketClient:
 
                                         # Market health filtering
                                         # Check 1: Has valid token ID
-                                        token_id = market_info.get('tokenID')
+                                        token_id = market_info.get('tokenID') or market_info.get('clobTokenIds', [None])[0]
                                         if not token_id:
+                                            logger.debug(f"Filtered market: no token ID found in {list(market_info.keys())}")
                                             filtered_count += 1
                                             continue
 
-                                        # Check 2: Check liquidity if available
-                                        liquidity = market_info.get('liquidity', 0)
+                                        # Check 2: Check liquidity if available (RELAXED - only filter if explicitly too low)
+                                        # Many markets don't report liquidity, so we'll be lenient
+                                        liquidity = market_info.get('liquidity') or market_info.get('liquidityNum', 0)
+                                        if isinstance(liquidity, str):
+                                            try:
+                                                liquidity = float(liquidity)
+                                            except:
+                                                liquidity = 0
+
+                                        # Only filter if liquidity is explicitly reported and very low
                                         if liquidity > 0 and liquidity < min_liquidity:
                                             logger.debug(f"Filtered market {token_id}: low liquidity ${liquidity:.2f}")
                                             filtered_count += 1
                                             continue
 
-                                        # Check 3: Has valid volume data (indicates activity)
-                                        volume = market_info.get('volume', event.get('volume', 0))
-                                        if volume == 0:
-                                            logger.debug(f"Filtered market {token_id}: zero volume")
-                                            filtered_count += 1
-                                            continue
+                                        # Check 3: Has valid volume data (RELAXED - allow zero volume for new markets)
+                                        # We'll accept markets even with zero volume as long as they're active
+                                        volume = market_info.get('volume') or market_info.get('volumeNum', 0) or event.get('volume', 0)
+                                        if isinstance(volume, str):
+                                            try:
+                                                volume = float(volume)
+                                            except:
+                                                volume = 0
+
+                                        # Don't filter by volume anymore - accept all active markets
 
                                         # Polymarket markets can be binary or multi-outcome
                                         # For simplicity, we'll focus on binary markets
@@ -255,8 +268,14 @@ class PolymarketClient:
         """
         score = 0.0
 
-        # Liquidity score (0-40 points)
-        liquidity = market_info.get('liquidity', 0)
+        # Liquidity score (0-40 points) - Handle missing data gracefully
+        liquidity = market_info.get('liquidity') or market_info.get('liquidityNum', 0)
+        if isinstance(liquidity, str):
+            try:
+                liquidity = float(liquidity)
+            except:
+                liquidity = 0
+
         if liquidity >= 10000:
             score += 40
         elif liquidity >= 5000:
@@ -265,9 +284,18 @@ class PolymarketClient:
             score += 20
         elif liquidity >= 100:
             score += 10
+        elif liquidity == 0:
+            # No liquidity data - give modest base score
+            score += 15
 
-        # Volume score (0-30 points)
-        volume = market_info.get('volume', event.get('volume', 0))
+        # Volume score (0-30 points) - Handle missing data gracefully
+        volume = market_info.get('volume') or market_info.get('volumeNum', 0) or event.get('volume', 0)
+        if isinstance(volume, str):
+            try:
+                volume = float(volume)
+            except:
+                volume = 0
+
         if volume >= 100000:
             score += 30
         elif volume >= 50000:
@@ -278,6 +306,9 @@ class PolymarketClient:
             score += 10
         elif volume >= 100:
             score += 5
+        elif volume == 0:
+            # No volume data - give modest base score
+            score += 10
 
         # Active status (0-20 points)
         if event.get('active', False) and not event.get('closed', False):
