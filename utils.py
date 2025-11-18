@@ -5,13 +5,87 @@ Includes retry logic, rate limiting, validation, and sanitization.
 
 import asyncio
 import logging
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, List
 from datetime import datetime, timedelta
 from functools import wraps
 import hashlib
 import re
 
 logger = logging.getLogger(__name__)
+
+
+class DualWindowRateLimiter:
+    """
+    Dual-window rate limiter for handling both burst and sustained rate limits.
+
+    Example: POST /order has:
+    - Burst: 2400 req / 10s (240/s)
+    - Sustained: 24000 req / 10min (40/s)
+
+    Both limits must be honored simultaneously.
+    """
+
+    def __init__(
+        self,
+        burst_calls: int,
+        burst_window: float,
+        sustained_calls: int,
+        sustained_window: float
+    ):
+        """Initialize dual-window rate limiter."""
+        self.burst_calls = burst_calls
+        self.burst_window = burst_window
+        self.sustained_calls = sustained_calls
+        self.sustained_window = sustained_window
+
+        # Track call timestamps
+        self.call_times: List[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """
+        Acquire permission to make an API call.
+        Blocks if either burst or sustained limit would be exceeded.
+        """
+        async with self._lock:
+            now = datetime.utcnow().timestamp()
+
+            # Remove old calls outside sustained window
+            cutoff = now - self.sustained_window
+            self.call_times = [t for t in self.call_times if t > cutoff]
+
+            # Check burst limit (shorter window)
+            burst_cutoff = now - self.burst_window
+            recent_burst_calls = sum(1 for t in self.call_times if t > burst_cutoff)
+
+            # Check sustained limit (longer window)
+            recent_sustained_calls = len(self.call_times)
+
+            # Calculate wait time needed
+            wait_time = 0.0
+
+            # If burst limit exceeded, wait until oldest burst call expires
+            if recent_burst_calls >= self.burst_calls:
+                burst_calls_in_window = [t for t in self.call_times if t > burst_cutoff]
+                if burst_calls_in_window:
+                    oldest_burst = min(burst_calls_in_window)
+                    wait_burst = (oldest_burst + self.burst_window - now) + 0.1
+                    wait_time = max(wait_time, wait_burst)
+
+            # If sustained limit exceeded, wait until oldest sustained call expires
+            if recent_sustained_calls >= self.sustained_calls:
+                oldest_sustained = min(self.call_times)
+                wait_sustained = (oldest_sustained + self.sustained_window - now) + 0.1
+                wait_time = max(wait_time, wait_sustained)
+
+            # Wait if necessary
+            if wait_time > 0:
+                logger.debug(f"Rate limit: waiting {wait_time:.2f}s (burst: {recent_burst_calls}/{self.burst_calls}, sustained: {recent_sustained_calls}/{self.sustained_calls})")
+                await asyncio.sleep(wait_time)
+                now = datetime.utcnow().timestamp()
+
+            # Record this call
+            self.call_times.append(now)
 
 
 class RateLimiter:
@@ -403,13 +477,37 @@ class PolymarketRateLimiter:
         self.clob_tick_size = RateLimiter(calls_per_second=50/10, burst=50)  # 50 req / 10s
         self.clob_markets_listing = RateLimiter(calls_per_second=100/10, burst=100)  # 100 req / 10s
 
-        # CLOB Trading (burst limits with longer windows)
-        self.clob_order_post = RateLimiter(calls_per_second=2400/10, burst=2400)  # 2400 req / 10s burst
-        self.clob_order_delete = RateLimiter(calls_per_second=2400/10, burst=2400)  # 2400 req / 10s burst
-        self.clob_orders_post = RateLimiter(calls_per_second=800/10, burst=800)  # 800 req / 10s burst
-        self.clob_orders_delete = RateLimiter(calls_per_second=800/10, burst=800)  # 800 req / 10s burst
-        self.clob_cancel_all = RateLimiter(calls_per_second=200/10, burst=200)  # 200 req / 10s
-        self.clob_cancel_market = RateLimiter(calls_per_second=800/10, burst=800)  # 800 req / 10s
+        # CLOB Trading - DUAL WINDOW (burst + sustained)
+        # POST /order: 2400 req/10s burst, 24000 req/10min sustained
+        self.clob_order_post = DualWindowRateLimiter(
+            burst_calls=2400, burst_window=10,
+            sustained_calls=24000, sustained_window=600
+        )
+        # DELETE /order: same as POST
+        self.clob_order_delete = DualWindowRateLimiter(
+            burst_calls=2400, burst_window=10,
+            sustained_calls=24000, sustained_window=600
+        )
+        # POST /orders: 800 req/10s burst, 12000 req/10min sustained
+        self.clob_orders_post = DualWindowRateLimiter(
+            burst_calls=800, burst_window=10,
+            sustained_calls=12000, sustained_window=600
+        )
+        # DELETE /orders: same as POST
+        self.clob_orders_delete = DualWindowRateLimiter(
+            burst_calls=800, burst_window=10,
+            sustained_calls=12000, sustained_window=600
+        )
+        # DELETE /cancel-all: 200 req/10s burst, 3000 req/10min sustained
+        self.clob_cancel_all = DualWindowRateLimiter(
+            burst_calls=200, burst_window=10,
+            sustained_calls=3000, sustained_window=600
+        )
+        # DELETE /cancel-market-orders: 800 req/10s burst, 12000 req/10min sustained
+        self.clob_cancel_market = DualWindowRateLimiter(
+            burst_calls=800, burst_window=10,
+            sustained_calls=12000, sustained_window=600
+        )
 
         # Other
         self.relayer_submit = RateLimiter(calls_per_second=15/60, burst=15)  # 15 req / 1 min

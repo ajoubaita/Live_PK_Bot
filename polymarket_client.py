@@ -5,7 +5,7 @@ Handles REST API calls and WebSocket connections to Polymarket.
 
 import asyncio
 import logging
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Set
 from datetime import datetime
 import aiohttp
 import websockets
@@ -41,6 +41,11 @@ class PolymarketClient:
         self.last_rotation_time: Optional[datetime] = None
         self.rotation_interval: int = 300  # 5 minutes in seconds
         self.markets_per_group: int = 20  # Subscribe to 20 markets at a time (reduced for stability)
+
+        # Subscription tracking
+        self.subscribed_markets: set = set()  # Successfully subscribed markets
+        self.pending_subscriptions: set = set()  # Markets awaiting acknowledgment
+        self.failed_subscriptions: Dict[str, int] = {}  # Market ID -> retry count
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -102,78 +107,187 @@ class PolymarketClient:
 
         return headers
 
-    async def fetch_markets(self) -> List[Market]:
+    async def fetch_markets(self, max_pages: int = 5, min_liquidity: float = 100.0) -> List[Market]:
         """
-        Fetch all active markets from Polymarket.
+        Fetch all active, liquid markets from Polymarket with pagination.
+
+        Args:
+            max_pages: Maximum number of pages to fetch (default 5 = 500 events)
+            min_liquidity: Minimum liquidity in USD to consider market viable (default $100)
 
         Returns:
-            List of Market objects
+            List of Market objects filtered by health criteria
         """
         markets = []
+        fetched_count = 0
+        filtered_count = 0
 
         try:
-            # Fetch events (which contain markets)
-            url = f"{self.base_url}/events"
-            params = {
-                "closed": "false",  # Only open events
-                "limit": 100
-            }
+            # Pagination support
+            for page in range(max_pages):
+                offset = page * 100
 
-            headers = self._get_headers()
+                # Fetch events (which contain markets)
+                url = f"{self.base_url}/events"
+                params = {
+                    "closed": "false",  # Only open events
+                    "limit": 100,
+                    "offset": offset
+                }
 
-            # Apply rate limiting
-            await self.rate_limiter.acquire_for_endpoint(url)
+                headers = self._get_headers()
 
-            async with self.session.get(url, headers=headers, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
+                # Apply rate limiting
+                await self.rate_limiter.acquire_for_endpoint(url)
 
-                    # Polymarket returns events, each containing markets
-                    for event in data:
-                        try:
-                            # Check if this event supports order book trading
-                            if not event.get('enableOrderBook', False):
-                                continue
+                async with self.session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
 
-                            # Extract markets from the event
-                            event_markets = event.get('markets', [])
+                        # Break if no more events
+                        if not data or len(data) == 0:
+                            logger.info(f"No more events on page {page + 1}, stopping pagination")
+                            break
 
-                            for market_info in event_markets:
-                                try:
-                                    # Polymarket markets can be binary or multi-outcome
-                                    # For simplicity, we'll focus on binary markets
-                                    market = Market(
-                                        platform=Platform.POLYMARKET,
-                                        market_id=market_info.get('conditionId', market_info.get('id', '')),
-                                        title=event.get('title', ''),
-                                        question=market_info.get('question', event.get('title', '')),
-                                        active=event.get('active', True) and not event.get('closed', False),
-                                        metadata={
-                                            'event': event,
-                                            'market': market_info,
-                                            'token_id': market_info.get('tokenID')
-                                        }
-                                    )
-                                    markets.append(market)
-
-                                except Exception as e:
-                                    logger.warning(f"Error parsing Polymarket market: {e}")
+                        # Polymarket returns events, each containing markets
+                        for event in data:
+                            try:
+                                # Check if this event supports order book trading
+                                if not event.get('enableOrderBook', False):
                                     continue
 
-                        except Exception as e:
-                            logger.warning(f"Error parsing Polymarket event: {e}")
-                            continue
+                                # Health check: Skip if event is inactive
+                                if not event.get('active', False) or event.get('closed', False):
+                                    continue
 
-                    logger.info(f"Fetched {len(markets)} markets from Polymarket")
+                                # Extract markets from the event
+                                event_markets = event.get('markets', [])
 
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to fetch Polymarket markets: {response.status} - {error_text}")
+                                for market_info in event_markets:
+                                    try:
+                                        fetched_count += 1
+
+                                        # Market health filtering
+                                        # Check 1: Has valid token ID
+                                        token_id = market_info.get('tokenID')
+                                        if not token_id:
+                                            filtered_count += 1
+                                            continue
+
+                                        # Check 2: Check liquidity if available
+                                        liquidity = market_info.get('liquidity', 0)
+                                        if liquidity > 0 and liquidity < min_liquidity:
+                                            logger.debug(f"Filtered market {token_id}: low liquidity ${liquidity:.2f}")
+                                            filtered_count += 1
+                                            continue
+
+                                        # Check 3: Has valid volume data (indicates activity)
+                                        volume = market_info.get('volume', event.get('volume', 0))
+                                        if volume == 0:
+                                            logger.debug(f"Filtered market {token_id}: zero volume")
+                                            filtered_count += 1
+                                            continue
+
+                                        # Polymarket markets can be binary or multi-outcome
+                                        # For simplicity, we'll focus on binary markets
+                                        market = Market(
+                                            platform=Platform.POLYMARKET,
+                                            market_id=market_info.get('conditionId', market_info.get('id', '')),
+                                            title=event.get('title', ''),
+                                            question=market_info.get('question', event.get('title', '')),
+                                            active=event.get('active', True) and not event.get('closed', False),
+                                            metadata={
+                                                'event': event,
+                                                'market': market_info,
+                                                'token_id': token_id,
+                                                'liquidity': liquidity,
+                                                'volume': volume,
+                                                'quality_score': self._calculate_market_quality(market_info, event)
+                                            }
+                                        )
+                                        markets.append(market)
+
+                                    except Exception as e:
+                                        logger.warning(f"Error parsing Polymarket market: {e}")
+                                        filtered_count += 1
+                                        continue
+
+                            except Exception as e:
+                                logger.warning(f"Error parsing Polymarket event: {e}")
+                                continue
+
+                        logger.info(f"Fetched page {page + 1}/{max_pages}: {len(data)} events, {len(markets)} viable markets so far")
+
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to fetch Polymarket markets (page {page + 1}): {response.status} - {error_text}")
+                        break
+
+            # Sort by quality score (highest first)
+            markets.sort(key=lambda m: m.metadata.get('quality_score', 0), reverse=True)
+
+            logger.info(
+                f"Polymarket market discovery complete: "
+                f"{len(markets)} viable markets (fetched {fetched_count}, filtered {filtered_count})"
+            )
 
         except Exception as e:
             logger.error(f"Error fetching Polymarket markets: {e}")
 
         return markets
+
+    def _calculate_market_quality(self, market_info: dict, event: dict) -> float:
+        """
+        Calculate quality score for a market (0-100).
+
+        Factors:
+        - Liquidity (higher is better)
+        - Volume (higher is better)
+        - Recent activity
+        - Event engagement
+
+        Args:
+            market_info: Market data
+            event: Event data
+
+        Returns:
+            Quality score (0-100)
+        """
+        score = 0.0
+
+        # Liquidity score (0-40 points)
+        liquidity = market_info.get('liquidity', 0)
+        if liquidity >= 10000:
+            score += 40
+        elif liquidity >= 5000:
+            score += 30
+        elif liquidity >= 1000:
+            score += 20
+        elif liquidity >= 100:
+            score += 10
+
+        # Volume score (0-30 points)
+        volume = market_info.get('volume', event.get('volume', 0))
+        if volume >= 100000:
+            score += 30
+        elif volume >= 50000:
+            score += 20
+        elif volume >= 10000:
+            score += 15
+        elif volume >= 1000:
+            score += 10
+        elif volume >= 100:
+            score += 5
+
+        # Active status (0-20 points)
+        if event.get('active', False) and not event.get('closed', False):
+            score += 20
+
+        # Order book enabled (0-10 points)
+        if event.get('enableOrderBook', False):
+            score += 10
+
+        return score
 
     async def fetch_orderbook(self, token_id: str) -> Optional[Dict]:
         """
@@ -216,13 +330,42 @@ class PolymarketClient:
         """
         self._message_handlers.append(handler)
 
-    async def _subscribe_with_throttling(self, ws: websockets.WebSocketClientProtocol, market_ids: List[str]) -> int:
+    def _handle_subscription_ack(self, message: dict):
         """
-        Subscribe to markets with throttling to prevent overwhelming the WebSocket.
+        Handle subscription acknowledgment messages from Polymarket WebSocket.
+
+        Args:
+            message: WebSocket message data
+        """
+        try:
+            # Polymarket sends different message types
+            # Check for subscription confirmation or market data (which implies subscription success)
+            msg_type = message.get('type', '')
+            market_id = message.get('market', '') or message.get('asset_id', '')
+
+            # If we receive market data for a pending subscription, mark as subscribed
+            if market_id and market_id in self.pending_subscriptions:
+                self.subscribed_markets.add(market_id)
+                self.pending_subscriptions.discard(market_id)
+                logger.debug(f"Confirmed subscription to market {market_id} via {msg_type} message")
+
+            # Handle explicit subscription acknowledgment (if Polymarket sends one)
+            if msg_type == 'subscribed' and market_id:
+                self.subscribed_markets.add(market_id)
+                self.pending_subscriptions.discard(market_id)
+                logger.info(f"Received explicit subscription confirmation for market {market_id}")
+
+        except Exception as e:
+            logger.debug(f"Error handling subscription ack: {e}")
+
+    async def _subscribe_with_throttling(self, ws: websockets.WebSocketClientProtocol, market_ids: List[str], max_retries: int = 3) -> int:
+        """
+        Subscribe to markets with throttling, retry logic, and acknowledgment tracking.
 
         Args:
             ws: Active WebSocket connection
             market_ids: List of market IDs to subscribe to
+            max_retries: Maximum retry attempts per market (default 3)
 
         Returns:
             Number of successful subscriptions
@@ -230,7 +373,7 @@ class PolymarketClient:
         successful_subs = 0
         failed_subs = 0
 
-        logger.info(f"Starting throttled subscription to {len(market_ids)} Polymarket markets...")
+        logger.info(f"Starting throttled subscription to {len(market_ids)} Polymarket markets (max {max_retries} retries per market)...")
 
         for i, market_id in enumerate(market_ids, 1):
             # Check if connection is still open before attempting
@@ -238,34 +381,81 @@ class PolymarketClient:
                 logger.warning(f"WebSocket closed during subscription at {i}/{len(market_ids)}")
                 break
 
-            try:
-                subscribe_msg = {
-                    "type": "subscribe",
-                    "channel": "market",
-                    "market": market_id
-                }
-                await ws.send(json.dumps(subscribe_msg))
+            # Check if already subscribed
+            if market_id in self.subscribed_markets:
+                logger.debug(f"Market {market_id} already subscribed, skipping")
                 successful_subs += 1
-
-                # Log progress every 100 subscriptions
-                if i % 100 == 0:
-                    logger.info(f"Subscription progress: {i}/{len(market_ids)} ({successful_subs} successful, {failed_subs} failed)")
-
-            except websockets.exceptions.ConnectionClosed:
-                logger.error(f"Connection closed while subscribing to market {market_id} ({i}/{len(market_ids)})")
-                break
-            except Exception as e:
-                logger.warning(f"Failed to subscribe to market {market_id}: {e}")
-                failed_subs += 1
-                # Continue with next market instead of breaking
                 continue
 
-            # Throttle: Wait 1.0 second between each subscription
-            # Slower throttle prevents overwhelming the WebSocket server
-            if i < len(market_ids):  # Don't wait after the last one
-                await asyncio.sleep(1.0)
+            # Attempt subscription with retries
+            retry_count = 0
+            subscribed = False
 
-        logger.info(f"Subscription complete: {successful_subs} successful, {failed_subs} failed out of {len(market_ids)} total")
+            while retry_count <= max_retries and not subscribed:
+                try:
+                    subscribe_msg = {
+                        "type": "subscribe",
+                        "channel": "market",
+                        "market": market_id
+                    }
+
+                    # Track as pending
+                    self.pending_subscriptions.add(market_id)
+
+                    # Send subscription request
+                    await ws.send(json.dumps(subscribe_msg))
+
+                    # Wait for acknowledgment (give it 2 seconds)
+                    await asyncio.sleep(2.0)
+
+                    # Check if we received confirmation (will be removed from pending in message handler)
+                    if market_id in self.subscribed_markets:
+                        successful_subs += 1
+                        subscribed = True
+                        logger.debug(f"Successfully subscribed to market {market_id} on attempt {retry_count + 1}")
+                    elif retry_count < max_retries:
+                        # No confirmation yet, retry
+                        retry_count += 1
+                        logger.warning(f"No acknowledgment for market {market_id}, retry {retry_count}/{max_retries}")
+                        self.pending_subscriptions.discard(market_id)
+                        await asyncio.sleep(1.0)  # Wait before retry
+                    else:
+                        # Max retries exceeded
+                        logger.error(f"Failed to subscribe to market {market_id} after {max_retries} attempts")
+                        self.pending_subscriptions.discard(market_id)
+                        self.failed_subscriptions[market_id] = retry_count
+                        failed_subs += 1
+
+                except websockets.exceptions.ConnectionClosed:
+                    logger.error(f"Connection closed while subscribing to market {market_id} ({i}/{len(market_ids)})")
+                    self.pending_subscriptions.discard(market_id)
+                    break
+                except Exception as e:
+                    logger.warning(f"Error subscribing to market {market_id} (attempt {retry_count + 1}): {e}")
+                    self.pending_subscriptions.discard(market_id)
+                    if retry_count >= max_retries:
+                        failed_subs += 1
+                        self.failed_subscriptions[market_id] = retry_count
+                        break
+                    retry_count += 1
+                    await asyncio.sleep(1.0)
+
+            # Log progress every 10 subscriptions
+            if i % 10 == 0:
+                logger.info(
+                    f"Subscription progress: {i}/{len(market_ids)} "
+                    f"({successful_subs} successful, {failed_subs} failed, "
+                    f"{len(self.pending_subscriptions)} pending)"
+                )
+
+            # Throttle: Wait between subscription attempts
+            if i < len(market_ids):
+                await asyncio.sleep(0.5)  # Reduced to 0.5s since we now have 2s confirmation wait
+
+        logger.info(
+            f"Subscription complete: {successful_subs} successful, {failed_subs} failed out of {len(market_ids)} total. "
+            f"Subscribed markets: {len(self.subscribed_markets)}"
+        )
         return successful_subs
 
     def _create_subscription_groups(self, market_ids: List[str]):
@@ -425,6 +615,9 @@ class PolymarketClient:
                         async for message in ws:
                             try:
                                 data = json.loads(message)
+
+                                # Handle subscription acknowledgments
+                                self._handle_subscription_ack(data)
 
                                 # Notify all registered handlers
                                 for handler in self._message_handlers:

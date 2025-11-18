@@ -21,11 +21,11 @@ class BotConfig(BaseSettings):
 
     # Kalshi API Configuration
     kalshi_api_base: str = Field(
-        default="https://api.elections.kalshi.com",
+        default="https://api.kalshi.com",
         description="Kalshi API base URL"
     )
     kalshi_ws_url: str = Field(
-        default="wss://api.elections.kalshi.com/trade-api/ws/v2",
+        default="wss://api.kalshi.com/trade-api/ws/v2",
         description="Kalshi WebSocket URL"
     )
     kalshi_email: Optional[str] = Field(

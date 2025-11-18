@@ -45,14 +45,70 @@ class BotSupervisor:
         # Background tasks
         self.tasks = []
 
+    async def _validate_credentials(self):
+        """
+        Validate API credentials before full initialization.
+        Fails fast if credentials are invalid.
+        """
+        logger.info("Validating API credentials...")
+
+        errors = []
+
+        # Validate Kalshi credentials
+        if not self.config.kalshi_api_key:
+            if not (self.config.kalshi_email and self.config.kalshi_password):
+                errors.append("Kalshi: No API key or email/password provided")
+        else:
+            logger.info(f"✓ Kalshi API key configured: {self.config.kalshi_api_key[:8]}...")
+
+        # Validate Polymarket credentials (optional for read-only)
+        if self.config.polymarket_api_key:
+            logger.info(f"✓ Polymarket API key configured: {self.config.polymarket_api_key[:8]}...")
+        else:
+            logger.warning("⚠ Polymarket API key not configured (read-only mode)")
+
+        # Validate required environment variables
+        if not self.config.kalshi_api_base:
+            errors.append("Kalshi: KALSHI_API_BASE not configured")
+        if not self.config.polymarket_api_base:
+            errors.append("Polymarket: POLYMARKET_API_BASE not configured")
+
+        if errors:
+            error_msg = "\n".join([f"  - {err}" for err in errors])
+            logger.error(f"Credential validation failed:\n{error_msg}")
+            raise ValueError(f"Invalid configuration:\n{error_msg}")
+
+        logger.info("✓ Credential validation passed")
+
+    async def _health_check_clients(self):
+        """
+        Perform health check on clients after connection.
+        """
+        logger.info("Performing client health checks...")
+
+        # Check Kalshi
+        if self.kalshi_client and self.kalshi_client.is_connected:
+            logger.info("✓ Kalshi client connected")
+        else:
+            logger.warning("✗ Kalshi client not connected")
+
+        # Check Polymarket
+        if self.polymarket_client and self.polymarket_client.is_connected:
+            logger.info("✓ Polymarket client connected")
+        else:
+            logger.warning("✗ Polymarket client not connected")
+
     async def initialize(self):
         """
-        Initialize all bot components.
+        Initialize all bot components with validation.
         """
         logger.info("Initializing bot components...")
 
         try:
-            # Initialize clients
+            # Step 1: Validate credentials first (fail fast)
+            await self._validate_credentials()
+
+            # Step 2: Initialize clients
             self.kalshi_client = KalshiClient()
             self.polymarket_client = PolymarketClient()
 
@@ -61,6 +117,9 @@ class BotSupervisor:
 
             self.metrics.kalshi_connected = True
             self.metrics.polymarket_connected = True
+
+            # Step 3: Health check
+            await self._health_check_clients()
 
             # Initialize market discovery
             self.market_discovery = MarketDiscovery(
@@ -110,22 +169,46 @@ class BotSupervisor:
             await self.market_discovery.discover_all_markets()
             self.market_discovery.find_market_pairs()
 
-            # Initialize orderbooks for all discovered markets
-            for market in self.market_discovery.get_all_markets():
+            # Get high-quality markets for subscription
+            kalshi_markets = self.market_discovery.kalshi_markets.values()
+            polymarket_markets = self.market_discovery.polymarket_markets.values()
+
+            # Filter Polymarket markets by quality score (top markets only)
+            high_quality_poly_markets = [
+                m for m in polymarket_markets
+                if m.metadata.get('quality_score', 0) >= 30  # Minimum quality score threshold
+            ]
+
+            # Sort by quality and limit
+            high_quality_poly_markets.sort(
+                key=lambda m: m.metadata.get('quality_score', 0),
+                reverse=True
+            )
+            max_markets = self.config.__dict__.get('max_markets_per_platform', 50)
+            high_quality_poly_markets = high_quality_poly_markets[:max_markets]
+
+            logger.info(f"Selected {len(high_quality_poly_markets)} high-quality Polymarket markets (quality >= 30)")
+
+            # Initialize orderbooks ONLY for markets we're subscribing to
+            markets_to_track = list(kalshi_markets)[:max_markets] + high_quality_poly_markets
+
+            for market in markets_to_track:
                 await self.orderbook_manager.initialize_market(market)
 
             # Update market count metric
             self.metrics.markets_tracked = await self.orderbook_manager.get_market_count()
 
-            # Start WebSocket feeds
-            kalshi_market_ids = self.market_discovery.get_market_ids_by_platform(Platform.KALSHI)
-            polymarket_market_ids = self.market_discovery.get_market_ids_by_platform(Platform.POLYMARKET)
+            # Start WebSocket feeds with quality-filtered markets
+            kalshi_market_ids = [m.market_id for m in list(kalshi_markets)[:max_markets]]
+            polymarket_market_ids = [m.market_id for m in high_quality_poly_markets]
+
+            logger.info(f"Starting WebSocket feeds: {len(kalshi_market_ids)} Kalshi, {len(polymarket_market_ids)} Polymarket")
 
             kalshi_ws_task = asyncio.create_task(
-                self.kalshi_client.connect_websocket(kalshi_market_ids[:50])  # Limit for demo
+                self.kalshi_client.connect_websocket(kalshi_market_ids)
             )
             polymarket_ws_task = asyncio.create_task(
-                self.polymarket_client.connect_websocket(polymarket_market_ids[:50])
+                self.polymarket_client.connect_websocket(polymarket_market_ids)
             )
 
             self.tasks.extend([kalshi_ws_task, polymarket_ws_task])
