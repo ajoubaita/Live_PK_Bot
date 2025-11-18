@@ -60,13 +60,13 @@ class OrderBookManager:
 
                 logger.debug(f"Initialized orderbooks for {platform.value} market {market_id}")
 
-    async def handle_websocket_message(self, platform: Platform, message: Dict):
+    async def handle_websocket_message(self, platform: Platform, message):
         """
         Process WebSocket messages and update order books.
 
         Args:
             platform: Platform the message came from
-            message: Message data dictionary
+            message: Message data (can be dict or list)
         """
         try:
             if platform == Platform.KALSHI:
@@ -75,7 +75,7 @@ class OrderBookManager:
                 await self._handle_polymarket_message(message)
 
         except Exception as e:
-            logger.error(f"Error handling WebSocket message from {platform.value}: {e}")
+            logger.error(f"Error handling WebSocket message from {platform.value}: {e}", exc_info=True)
 
     async def _handle_kalshi_message(self, message: Dict):
         """
@@ -155,54 +155,92 @@ class OrderBookManager:
         except Exception as e:
             logger.error(f"Error processing Kalshi message: {e}")
 
-    async def _handle_polymarket_message(self, message: Dict):
+    async def _handle_polymarket_message(self, message):
         """
         Handle Polymarket WebSocket messages.
 
         Args:
-            message: Polymarket message data
+            message: Polymarket message data (can be dict or list of dicts)
         """
         try:
-            msg_type = message.get('type', '')
+            # Polymarket can send either a single message or an array of messages
+            messages = message if isinstance(message, list) else [message]
 
-            if msg_type == 'book':
-                # Polymarket sends full book updates
-                market_id = message.get('market')
-                if not market_id:
-                    return
+            for msg in messages:
+                # Skip if not a dict
+                if not isinstance(msg, dict):
+                    logger.debug(f"Skipping non-dict message: {type(msg)}")
+                    continue
 
-                # Get book data
-                bids = message.get('bids', [])
-                asks = message.get('asks', [])
+                # Check for event_type (Polymarket's field name)
+                event_type = msg.get('event_type', '') or msg.get('type', '')
 
-                # Polymarket typically sends YES outcome data
-                # You may need to adjust based on actual API response structure
-                if bids:
-                    best_bid = bids[0]  # [price, size]
-                    await self.update_orderbook(
-                        platform=Platform.POLYMARKET,
-                        market_id=market_id,
-                        outcome=Outcome.YES,
-                        bid_price=float(best_bid['price']),
-                        bid_size=int(best_bid['size']),
-                        ask_price=None,
-                        ask_size=None
-                    )
+                if event_type == 'book':
+                    # Polymarket sends full book updates
+                    # Field is 'asset_id', not 'market'
+                    market_id = msg.get('asset_id') or msg.get('market')
+                    if not market_id:
+                        logger.debug(f"Book event missing asset_id: {list(msg.keys())}")
+                        continue
 
-                if asks:
-                    best_ask = asks[0]
-                    await self.update_orderbook(
-                        platform=Platform.POLYMARKET,
-                        market_id=market_id,
-                        outcome=Outcome.YES,
-                        bid_price=None,
-                        bid_size=None,
-                        ask_price=float(best_ask['price']),
-                        ask_size=int(best_ask['size'])
-                    )
+                    # Get book data
+                    bids = msg.get('bids', [])
+                    asks = msg.get('asks', [])
+
+                    # Polymarket sends bids/asks as arrays: [[price, size], [price, size], ...]
+                    # Polymarket typically sends YES outcome data
+                    if bids and len(bids) > 0:
+                        best_bid = bids[0]  # First element is best bid
+                        # Can be either [price, size] or {"price": x, "size": y}
+                        if isinstance(best_bid, (list, tuple)) and len(best_bid) >= 2:
+                            bid_price = float(best_bid[0])
+                            bid_size = float(best_bid[1])
+                        elif isinstance(best_bid, dict):
+                            bid_price = float(best_bid.get('price', 0))
+                            bid_size = float(best_bid.get('size', 0))
+                        else:
+                            logger.debug(f"Unexpected bid format: {type(best_bid)}, {best_bid}")
+                            bid_price = None
+                            bid_size = None
+
+                        if bid_price is not None and bid_size is not None:
+                            await self.update_orderbook(
+                                platform=Platform.POLYMARKET,
+                                market_id=market_id,
+                                outcome=Outcome.YES,
+                                bid_price=bid_price,
+                                bid_size=bid_size,
+                                ask_price=None,
+                                ask_size=None
+                            )
+
+                    if asks and len(asks) > 0:
+                        best_ask = asks[0]
+                        # Can be either [price, size] or {"price": x, "size": y}
+                        if isinstance(best_ask, (list, tuple)) and len(best_ask) >= 2:
+                            ask_price = float(best_ask[0])
+                            ask_size = float(best_ask[1])
+                        elif isinstance(best_ask, dict):
+                            ask_price = float(best_ask.get('price', 0))
+                            ask_size = float(best_ask.get('size', 0))
+                        else:
+                            logger.debug(f"Unexpected ask format: {type(best_ask)}, {best_ask}")
+                            ask_price = None
+                            ask_size = None
+
+                        if ask_price is not None and ask_size is not None:
+                            await self.update_orderbook(
+                                platform=Platform.POLYMARKET,
+                                market_id=market_id,
+                                outcome=Outcome.YES,
+                                bid_price=None,
+                                bid_size=None,
+                                ask_price=ask_price,
+                                ask_size=ask_size
+                            )
 
         except Exception as e:
-            logger.error(f"Error processing Polymarket message: {e}")
+            logger.error(f"Error processing Polymarket message: {e}", exc_info=True)
 
     async def update_orderbook(
         self,
