@@ -1,375 +1,297 @@
-# High-Frequency Arbitrage Trading Bot
+# Kalshi-Polymarket Arbitrage Trading Bot
 
-A production-grade, fully autonomous arbitrage trading bot for Kalshi and Polymarket prediction markets. The bot operates in **simulation mode only** - no real trades are executed.
+Production-grade, fully autonomous arbitrage trading bot for Kalshi and Polymarket prediction markets. Operates in **simulation mode only** - no real trades executed.
 
-## 🎯 Features
+## 🚀 Quick Start
 
-### Core Capabilities
-- **Dual-Platform Support**: Monitors both Kalshi and Polymarket simultaneously
-- **Real-Time Data**: WebSocket connections for low-latency price updates
-- **Arbitrage Detection**:
-  - Intra-platform arbitrage (when YES + NO prices < $1.00)
-  - Cross-platform arbitrage (price differences between platforms)
-- **Automatic Market Pairing**: Fuzzy matching to identify equivalent markets
-- **Simulation Mode**: All trades are simulated and logged, zero financial risk
+```bash
+# Navigate to bot directory
+cd /opt/arbitrage-bot
 
-### Technical Features
-- **Fully Asynchronous**: Built with asyncio for maximum performance
-- **Auto-Recovery**: Automatic reconnection with exponential backoff
-- **Persistent Logging**: Dual storage (JSON Lines + SQLite)
-- **Health Monitoring**: Real-time status checks and metrics
-- **Graceful Shutdown**: Proper cleanup on SIGINT/SIGTERM
-- **Cloud-Ready**: Designed for 24/7 operation in cloud environments
+# Install dependencies (first time only)
+./startup.sh --install
+
+# Configure credentials
+nano .env  # Add your API keys
+
+# Start the bot
+./startup.sh --background
+
+# Monitor logs
+./startup.sh --logs
+```
+
+## ✨ Features
+
+- **Real-Time WebSocket Feeds**: Low-latency market data from both exchanges
+- **Dual Arbitrage Detection**: Intra-platform (YES + NO < $1.00) and cross-platform opportunities
+- **Auto-Recovery**: Exponential backoff reconnection with circuit breakers
+- **Rate Limiting**: Respects all API limits (burst + sustained windows)
+- **Subscription Rotation**: Efficiently handles 1000+ markets
+- **Comprehensive Logging**: Debug, info, and error tracking with 5-minute summaries
+- **24/7 Operation**: Cloud-ready with tmux/systemd support
 
 ## 📋 Requirements
 
 - Python 3.9+
-- Linux/macOS (Windows supported but uvloop unavailable)
-- Internet connection for API access
+- Linux server (Ubuntu recommended)
+- Kalshi API key
+- Polymarket API credentials
 
-## 🚀 Installation
+## ⚙️ Configuration
 
-### 1. Clone the Repository
-
-```bash
-git clone <repository-url>
-cd Live_PK_Bot
-```
-
-### 2. Create Virtual Environment
+Edit `/opt/arbitrage-bot/.env`:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Kalshi API
+KALSHI_API_BASE=https://api.kalshi.com
+KALSHI_WS_URL=wss://api.kalshi.com/trade-api/ws/v2
+KALSHI_API_KEY=your_api_key_here
+
+# Polymarket API
+POLYMARKET_API_KEY=your_api_key
+POLYMARKET_PRIVATE_KEY=your_private_key
+
+# Trading Parameters
+MIN_PROFIT_THRESHOLD=0.01        # 1 cent minimum profit
+MAX_TRADE_SIZE=100               # Max shares per trade
+UPDATE_INTERVAL=0.1              # Scan every 0.1s (10 Hz)
+MARKET_SIMILARITY_THRESHOLD=0.5  # Fuzzy matching threshold
 ```
 
-### 3. Install Dependencies
+## 🎮 Commands
 
 ```bash
-pip install -r requirements.txt
+./startup.sh                # Start in foreground
+./startup.sh --background   # Start in tmux (recommended)
+./startup.sh --stop         # Stop the bot
+./startup.sh --status       # Check if running
+./startup.sh --logs         # View real-time logs
+./startup.sh --install      # Install dependencies
 ```
 
-### 4. Configure Environment
+### Tmux Session Management
 
 ```bash
-cp .env.example .env
+# Attach to running session
+tmux attach -t arbitrage-bot
+
+# Detach (keep bot running)
+# Press: Ctrl+B, then D
+
+# Kill session
+tmux kill-session -t arbitrage-bot
 ```
 
-Edit `.env` and add your API credentials:
+## 📊 Monitoring
 
-```env
-# Kalshi API Configuration
-KALSHI_EMAIL=your_email@example.com
-KALSHI_PASSWORD=your_password
-KALSHI_API_KEY=your_api_key  # Optional
-
-# Polymarket API Configuration
-POLYMARKET_API_KEY=your_api_key  # Optional
-POLYMARKET_SECRET=your_secret    # Optional
-
-# Bot Configuration
-MIN_PROFIT_THRESHOLD=0.01
-MAX_TRADE_SIZE=100
-UPDATE_INTERVAL=0.1
-```
-
-> **Note**: API credentials are optional for read-only market data access. Some endpoints may require authentication.
-
-## 🎮 Usage
-
-### Start the Bot
+### Log Files
 
 ```bash
-python main.py
+# Main bot log
+tail -f /var/log/arbitrage-bot/trading_bot.log
+
+# Trade history (JSON Lines)
+tail -f /var/log/arbitrage-bot/trades.jsonl
+
+# Or use startup script
+./startup.sh --logs
 ```
 
-### Monitor Logs
+### Expected Output
 
-The bot outputs to both console and log files:
-
-```bash
-# Watch main log
-tail -f trading_bot.log
-
-# Watch trade log (JSON Lines format)
-tail -f trades.jsonl
+**Successful Startup:**
+```
+[INFO] Polymarket WebSocket connected, waiting for handshake completion...
+[INFO] WebSocket handshake complete, ready for subscriptions
+[INFO] Successfully subscribed to 20/20 markets (group 1/66)
+[INFO] Using Kalshi API key authentication for data access
+[INFO] Kalshi WebSocket connected successfully
+[INFO] Found X market pairs
+[INFO] Starting arbitrage scanning...
 ```
 
-### Stop the Bot
-
-Press `Ctrl+C` for graceful shutdown. The bot will:
-1. Close all WebSocket connections
-2. Flush logs to disk
-3. Save final metrics
-4. Exit cleanly
-
-## 📊 Output & Monitoring
-
-### Console Output
-
-The bot displays periodic status updates every 30 seconds:
-
+**Periodic Summary (every 5 minutes):**
 ```
-================================================================================
-Bot Status - Uptime: 01:23:45
---------------------------------------------------------------------------------
-Markets Tracked: 150
-Opportunities Detected: 25
-Trades Simulated: 8
-Total Simulated Profit: $12.45
-Kalshi Connected: ✓
-Polymarket Connected: ✓
-================================================================================
-```
-
-### Trade Logs
-
-Simulated trades are logged to `trades.jsonl`:
-
-```json
-{
-  "opportunity_id": "550e8400-e29b-41d4-a716-446655440000",
-  "timestamp": "2025-01-15T10:30:45.123456",
-  "type": "cross-platform",
-  "buy": {
-    "platform": "kalshi",
-    "market_id": "ECON-INFLATION-2025",
-    "outcome": "yes",
-    "price": 0.45,
-    "size": 100
-  },
-  "sell": {
-    "platform": "polymarket",
-    "market_id": "0x1234...",
-    "outcome": "yes",
-    "price": 0.52,
-    "size": 100
-  },
-  "profit": 7.0,
-  "return_pct": 15.56
-}
-```
-
-### SQLite Database
-
-Query the database for analytics:
-
-```bash
-sqlite3 trading_bot.db
-
-# Get recent trades
-SELECT * FROM trades ORDER BY timestamp DESC LIMIT 10;
-
-# Calculate total profit
-SELECT SUM(expected_profit) FROM trades;
-
-# Get metrics history
-SELECT * FROM metrics ORDER BY timestamp DESC LIMIT 20;
+[INFO] Arbitrage Scan Summary (last 5min):
+Markets checked: 1500
+Skipped (no data): 400
+Skipped (low spread): 1050
+Skipped (no size): 50
+Opportunities found: 2
 ```
 
 ## 🏗️ Architecture
 
-### Project Structure
+### Core Components
+
+| File | Purpose |
+|------|---------|
+| `main.py` | Entry point and initialization |
+| `supervisor.py` | Runtime orchestration and health checks |
+| `kalshi_client.py` | Kalshi API/WebSocket with API key auth |
+| `polymarket_client.py` | Polymarket API/WebSocket with rotation |
+| `arbitrage_engine.py` | Opportunity detection with fee calculation |
+| `market_discovery.py` | Fuzzy market pairing |
+| `orderbook_manager.py` | Real-time order book tracking |
+| `trade_logger.py` | SQLite + JSON Lines persistence |
+| `utils.py` | Rate limiting (dual-window), circuit breakers |
+
+### Data Flow
 
 ```
-Live_PK_Bot/
-├── main.py                 # Entry point
-├── supervisor.py           # Runtime orchestration
-├── config.py              # Configuration management
-├── models.py              # Data models
-├── kalshi_client.py       # Kalshi API client
-├── polymarket_client.py   # Polymarket API client
-├── market_discovery.py    # Market pairing logic
-├── orderbook_manager.py   # Order book management
-├── arbitrage_engine.py    # Arbitrage detection
-├── trade_logger.py        # Persistent logging
-├── requirements.txt       # Dependencies
-├── .env.example          # Example configuration
-└── README.md             # This file
+WebSocket → Order Book → Arbitrage Engine → Trade Logger
+                ↓
+         Market Discovery
 ```
 
-### Component Flow
+## 🔧 Advanced Settings
 
+### WebSocket Performance
+
+- **Handshake wait**: 2 seconds (prevents "no close frame" errors)
+- **Subscription throttle**: 1 second per market
+- **Group size**: 20 markets per subscription group
+- **Rotation**: Every 5 minutes
+- **Keepalive**: 15-second ping/pong
+
+### Rate Limits
+
+Polymarket uses dual-window rate limiting:
+- **Burst**: Short-term limit (e.g., 2400 req/10s)
+- **Sustained**: Long-term limit (e.g., 24000 req/10min)
+
+Kalshi uses token bucket algorithm with API key authentication.
+
+### Profit Calculation
+
+```python
+# Includes exchange fees
+kalshi_fee = 0.007   # 0.7%
+polymarket_fee = 0.02 # 2%
+
+profit = sell_price * (1 - sell_fee) - buy_price * (1 + buy_fee)
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Supervisor                              │
-│  (Orchestrates all components + health checks)              │
-└─────────────────────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│   Kalshi     │   │ Polymarket   │   │   Market     │
-│   Client     │   │   Client     │   │  Discovery   │
-│  (WebSocket) │   │  (WebSocket) │   │   (Pairing)  │
-└──────┬───────┘   └──────┬───────┘   └──────────────┘
-       │                  │
-       └────────┬─────────┘
-                ▼
-    ┌──────────────────────┐
-    │  OrderBook Manager   │
-    │  (In-memory books)   │
-    └──────────┬───────────┘
-               ▼
-    ┌──────────────────────┐
-    │  Arbitrage Engine    │
-    │  (Opportunity scan)  │
-    └──────────┬───────────┘
-               ▼
-    ┌──────────────────────┐
-    │   Trade Logger       │
-    │ (SQLite + JSON Lines)│
-    └──────────────────────┘
-```
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MIN_PROFIT_THRESHOLD` | Minimum profit per share to trigger trade | `0.01` |
-| `MAX_TRADE_SIZE` | Maximum shares per simulated trade | `100` |
-| `UPDATE_INTERVAL` | Seconds between arbitrage scans | `0.1` |
-| `MARKET_REFRESH_INTERVAL` | Seconds between market discovery | `300` |
-| `LOG_LEVEL` | Logging level (DEBUG/INFO/WARNING/ERROR) | `INFO` |
-| `WEBSOCKET_TIMEOUT` | Seconds before considering WS dead | `30` |
-| `RECONNECT_BASE_DELAY` | Base delay for exponential backoff | `2` |
-
-### Customization
-
-Edit `config.py` to add new configuration parameters or modify validation logic.
-
-## 🔍 How It Works
-
-### 1. Market Discovery
-- Fetches all active markets from Kalshi and Polymarket
-- Uses fuzzy text matching to pair equivalent markets
-- Continuously refreshes to detect new markets
-
-### 2. Real-Time Data Ingestion
-- Establishes WebSocket connections to both platforms
-- Maintains in-memory order books with best bid/ask
-- Auto-reconnects on disconnection with exponential backoff
-
-### 3. Arbitrage Detection
-
-**Intra-Platform Arbitrage:**
-- Detects when `BestAsk(YES) + BestAsk(NO) < $1.00`
-- Simulates buying both outcomes for guaranteed profit
-
-**Cross-Platform Arbitrage:**
-- Compares prices of paired markets
-- Detects when `Price(Platform A) < Price(Platform B) - threshold`
-- Simulates buy low / sell high strategy
-
-### 4. Trade Simulation
-- Validates opportunity is still profitable
-- Calculates optimal trade size
-- Logs simulated trade with all details
-- Updates metrics and profit tracking
-
-### 5. Health Monitoring
-- Periodic connection health checks
-- Automatic reconnection on failures
-- Metrics logging every minute
-- Status display every 30 seconds
-
-## 🚨 Important Notes
-
-### Simulation Only
-**This bot does NOT execute real trades.** All arbitrage opportunities are simulated and logged. To enable real trading, you would need to:
-1. Implement order placement functions in the API clients
-2. Add risk management and position tracking
-3. Handle order fills and cancellations
-4. Implement proper error handling for failed orders
-
-### API Rate Limits
-Be mindful of API rate limits:
-- Kalshi: Check their documentation for current limits
-- Polymarket: Check their documentation for current limits
-
-The bot uses WebSockets for real-time data to minimize REST API calls.
-
-### Network Requirements
-- Stable internet connection required
-- Low latency preferred for competitive arbitrage
-- Consider deploying near API endpoints (AWS us-east-1, etc.)
 
 ## 🐛 Troubleshooting
 
-### WebSocket Disconnections
-The bot automatically reconnects with exponential backoff. Check logs for connection errors.
+| Issue | Solution |
+|-------|----------|
+| `ModuleNotFoundError: pydantic_settings` | Run `./startup.sh --install` |
+| WebSocket disconnects after 2 markets | Fixed - handshake wait now implemented |
+| Kalshi 404/401 errors | Fixed - uses API key auth, not deprecated login |
+| 0 market pairs found | Lower MARKET_SIMILARITY_THRESHOLD to 0.4-0.5 |
+| High CPU usage | Verify UPDATE_INTERVAL=0.1 in .env |
 
-### No Opportunities Found
-This is normal. Arbitrage opportunities are rare and fleeting. The bot continuously monitors and will log opportunities when detected.
+### Debug Mode
 
-### Database Locked Errors
-Ensure only one instance of the bot is running. SQLite has limited concurrency.
+```bash
+# Edit .env
+LOG_LEVEL=DEBUG
 
-### Authentication Failures
-Verify your API credentials in `.env`. Some endpoints work without authentication.
+# Restart
+./startup.sh --stop && ./startup.sh --background
+```
 
-## 📈 Performance Optimization
+### Health Checks
 
-### For Production Deployment:
+```bash
+# Check process
+ps aux | grep "python.*main.py"
 
-1. **Use uvloop** (Linux/macOS only):
-   ```bash
-   pip install uvloop
-   ```
+# Verify WebSocket connections
+grep "WebSocket connected" /var/log/arbitrage-bot/trading_bot.log | tail -5
 
-2. **Use faster JSON parser**:
-   ```bash
-   pip install orjson
-   ```
+# Check subscriptions
+grep "Successfully subscribed" /var/log/arbitrage-bot/trading_bot.log | tail -10
 
-3. **Deploy on cloud**:
-   - AWS EC2 (us-east-1 for low latency)
-   - DigitalOcean Droplet
-   - Google Cloud Compute
+# Find market pairs
+grep "Found.*market pairs" /var/log/arbitrage-bot/trading_bot.log
 
-4. **Adjust scan frequency**:
-   ```env
-   UPDATE_INTERVAL=0.05  # Scan every 50ms
-   ```
+# Watch for opportunities
+grep "arbitrage" /var/log/arbitrage-bot/trading_bot.log | tail -20
+```
 
-5. **Monitor system resources**:
-   ```bash
-   htop  # CPU/Memory usage
-   iotop # Disk I/O
-   ```
+## 📈 Performance
+
+### Resource Usage
+
+- **CPU**: <5% idle, ~15% during active scanning
+- **Memory**: 100-200 MB
+- **Network**: Minimal (WebSocket streams only)
+- **Disk**: ~10 MB/day logs (with rotation)
+
+### Timing
+
+- **Initial subscription**: ~24 minutes (1302 markets at 1s/market)
+- **Scan frequency**: 10 Hz (0.1s interval)
+- **Market refresh**: Every 5 minutes
+- **Reconnect backoff**: 2s → 60s exponential cap
 
 ## 🔐 Security
 
-- Never commit `.env` file to version control
-- Use environment variables for secrets
-- Rotate API keys regularly
-- Use read-only API keys when possible
-- Run with minimal system privileges
+- API keys in `.env` (not tracked by git)
+- Private keys in separate files with `chmod 600`
+- No credentials in logs
+- Simulation mode only (paper trading)
 
-## 📝 License
+## 📚 Documentation
 
-[Add your license here]
+- **README.md**: This file - main documentation
+- **DEPLOYMENT_INSTRUCTIONS.md**: Detailed deployment guide with fixes
+- **requirements.txt**: Python dependencies
+- **.env.production**: Environment variable template
 
-## 🤝 Contributing
+## 🎯 Success Criteria
 
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
+Bot is working correctly when logs show:
+
+1. ✅ "WebSocket handshake complete, ready for subscriptions"
+2. ✅ "Successfully subscribed to 20/20 markets"
+3. ✅ "Using Kalshi API key authentication"
+4. ✅ "Found X market pairs" (X > 0)
+5. ✅ No disconnection loops or auth errors
+6. ✅ Periodic "Arbitrage Scan Summary" every 5 minutes
+
+## ⚠️ Important Notes
+
+### Simulation Only
+
+**No real trades are executed.** All opportunities are simulated and logged for analysis.
+
+### API Rate Limits
+
+The bot respects all documented rate limits to prevent throttling or bans.
+
+### Network Requirements
+
+- Stable internet connection
+- Low latency preferred (deploy near exchange servers)
+- Recommend AWS us-east-1 or similar
+
+## 🚀 Deployment
+
+See **DEPLOYMENT_INSTRUCTIONS.md** for complete deployment steps including:
+- Server setup
+- Environment configuration
+- Critical fixes applied
+- Monitoring and verification
+
+## 📝 Version History
+
+- **1.0.0** (Nov 2024): Production release with critical WebSocket and auth fixes
 
 ## 📧 Support
 
-For issues or questions:
-- Open an issue on GitHub
-- Check logs for error messages
-- Review configuration settings
+For issues:
+1. Check logs: `./startup.sh --logs`
+2. Review troubleshooting section
+3. See DEPLOYMENT_INSTRUCTIONS.md
 
 ## ⚠️ Disclaimer
 
-This software is for educational and research purposes only. Use at your own risk. The authors are not responsible for any financial losses or damages. Always comply with platform terms of service and applicable regulations.
+Educational and research purposes only. Use at your own risk. Authors not responsible for losses. Comply with platform ToS and regulations.
 
 ---
 
-**Built with ❤️ using Python and asyncio**
+**Status**: Production-ready | **Mode**: Simulation Only | **Version**: 1.0.0
