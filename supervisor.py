@@ -185,7 +185,7 @@ class BotSupervisor:
                 key=lambda m: m.metadata.get('quality_score', 0),
                 reverse=True
             )
-            max_markets = self.config.__dict__.get('max_markets_per_platform', 50)
+            max_markets = getattr(self.config, 'max_markets_per_platform', 50)
             high_quality_poly_markets = high_quality_poly_markets[:max_markets]
 
             logger.info(f"Selected {len(high_quality_poly_markets)} high-quality Polymarket markets (quality >= 20)")
@@ -324,15 +324,50 @@ class BotSupervisor:
 
     async def _market_refresh_loop(self):
         """
-        Periodically refresh market data.
+        Periodically refresh market data and update WebSocket subscriptions.
         """
         while self.running:
             try:
                 await asyncio.sleep(self.config.market_refresh_interval)
                 await self.market_discovery.refresh_markets()
 
+                # Get updated market lists
+                kalshi_markets = list(self.market_discovery.kalshi_markets.values())
+                polymarket_markets = list(self.market_discovery.polymarket_markets.values())
+
+                # Filter Polymarket markets by quality (same criteria as startup)
+                max_markets = getattr(self.config, 'max_markets_per_platform', 50)
+                high_quality_poly = [
+                    m for m in polymarket_markets
+                    if m.metadata.get('quality_score', 0) >= 20
+                ]
+                high_quality_poly.sort(
+                    key=lambda m: m.metadata.get('quality_score', 0),
+                    reverse=True
+                )
+                high_quality_poly = high_quality_poly[:max_markets]
+
+                # Update Kalshi subscriptions
+                kalshi_ids = [m.market_id for m in kalshi_markets[:max_markets]]
+                if self.kalshi_client and self.kalshi_client.ws_connection:
+                    await self.kalshi_client.update_subscriptions(kalshi_ids)
+
+                # Update Polymarket subscriptions
+                poly_token_ids = [
+                    m.metadata.get('token_id') for m in high_quality_poly
+                    if m.metadata.get('token_id')
+                ]
+                if self.polymarket_client and self.polymarket_client.ws_connection:
+                    await self.polymarket_client.update_subscriptions(poly_token_ids)
+
+                # Initialize orderbooks for any new markets
+                for market in kalshi_markets[:max_markets] + high_quality_poly:
+                    await self.orderbook_manager.initialize_market(market)
+
                 # Update market count
                 self.metrics.markets_tracked = await self.orderbook_manager.get_market_count()
+
+                logger.info(f"Market refresh complete: {len(kalshi_ids)} Kalshi, {len(poly_token_ids)} Polymarket")
 
             except asyncio.CancelledError:
                 break
