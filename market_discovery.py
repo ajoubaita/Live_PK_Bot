@@ -121,7 +121,7 @@ class MarketDiscovery:
         # Use SequenceMatcher for fuzzy matching
         return SequenceMatcher(None, norm1, norm2).ratio()
 
-    def find_market_pairs(self, similarity_threshold: float = 0.6) -> List[MarketPair]:
+    def find_market_pairs(self, similarity_threshold: float = 0.4) -> List[MarketPair]:
         """
         Find matching market pairs between platforms.
 
@@ -132,8 +132,10 @@ class MarketDiscovery:
             List of MarketPair objects
         """
         pairs = []
+        top_matches = []  # Track top matches for debugging
 
-        logger.info("Pairing markets across platforms...")
+        logger.info(f"Pairing markets across platforms (threshold={similarity_threshold})...")
+        logger.info(f"Comparing {len(self.kalshi_markets)} Kalshi markets with {len(self.polymarket_markets)} Polymarket markets")
 
         # Compare each Kalshi market with each Polymarket market
         for kalshi_id, kalshi_market in self.kalshi_markets.items():
@@ -158,6 +160,10 @@ class MarketDiscovery:
                     best_score = similarity
                     best_match = poly_market
 
+            # Track top matches for debugging (even below threshold)
+            if best_match and best_score >= 0.3:
+                top_matches.append((best_score, kalshi_market.title[:50], best_match.title[:50]))
+
             # If we found a match above threshold, create a pair
             if best_match and best_score >= similarity_threshold:
                 pair = MarketPair(
@@ -167,13 +173,32 @@ class MarketDiscovery:
                 )
                 pairs.append(pair)
 
-                logger.debug(
-                    f"Paired markets (confidence={best_score:.2f}): "
-                    f"{kalshi_market.title} <-> {best_match.title}"
+                logger.info(
+                    f"Paired (confidence={best_score:.2f}): "
+                    f"{kalshi_market.title[:40]} <-> {best_match.title[:40]}"
                 )
 
+        # Log top matches for debugging (sorted by score)
+        top_matches.sort(reverse=True)
+        if top_matches:
+            logger.info("Top 10 potential matches (including below threshold):")
+            for score, kalshi_title, poly_title in top_matches[:10]:
+                status = "✓" if score >= similarity_threshold else "✗"
+                logger.info(f"  {status} {score:.2f}: {kalshi_title} <-> {poly_title}")
+        else:
+            logger.warning("No matches found with score >= 0.3")
+            # Log sample markets for debugging
+            kalshi_sample = list(self.kalshi_markets.values())[:3]
+            poly_sample = list(self.polymarket_markets.values())[:3]
+            logger.info("Sample Kalshi markets:")
+            for m in kalshi_sample:
+                logger.info(f"  - {m.title}")
+            logger.info("Sample Polymarket markets:")
+            for m in poly_sample:
+                logger.info(f"  - {m.title}")
+
         self.market_pairs = pairs
-        logger.info(f"Found {len(pairs)} market pairs")
+        logger.info(f"Found {len(pairs)} market pairs (threshold={similarity_threshold})")
 
         return pairs
 

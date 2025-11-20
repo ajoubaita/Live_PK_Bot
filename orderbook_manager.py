@@ -69,6 +69,14 @@ class OrderBookManager:
             message: Message data (can be dict or list)
         """
         try:
+            # Log every incoming message for debugging
+            if isinstance(message, dict):
+                msg_type = message.get('type', message.get('event_type', 'unknown'))
+                market_id = message.get('market_ticker', message.get('asset_id', 'N/A'))
+                logger.debug(f"[{platform.value}] Received: type={msg_type}, market={market_id}")
+            elif isinstance(message, list):
+                logger.debug(f"[{platform.value}] Received array with {len(message)} messages")
+
             if platform == Platform.KALSHI:
                 await self._handle_kalshi_message(message)
             elif platform == Platform.POLYMARKET:
