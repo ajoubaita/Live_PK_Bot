@@ -384,16 +384,33 @@ class BotSupervisor:
             try:
                 await asyncio.sleep(self.config.heartbeat_interval)
 
-                # Check client connections
-                self.metrics.kalshi_connected = self.kalshi_client.is_connected if self.kalshi_client else False
-                self.metrics.polymarket_connected = self.polymarket_client.is_connected if self.polymarket_client else False
+                # Check REST client connections
+                kalshi_rest = self.kalshi_client.is_connected if self.kalshi_client else False
+                poly_rest = self.polymarket_client.is_connected if self.polymarket_client else False
 
-                # Log health status
-                if not self.metrics.kalshi_connected:
-                    logger.warning("Kalshi client is disconnected")
+                # Check WebSocket health (requires actual data received)
+                kalshi_ws = self.kalshi_client.ws_healthy if self.kalshi_client else False
+                poly_ws = self.polymarket_client.is_connected if self.polymarket_client else False
 
-                if not self.metrics.polymarket_connected:
-                    logger.warning("Polymarket client is disconnected")
+                # Update metrics (use WS health as primary indicator)
+                self.metrics.kalshi_connected = kalshi_ws
+                self.metrics.polymarket_connected = poly_ws
+
+                # Log health status with details
+                if not kalshi_rest:
+                    logger.warning("Kalshi REST client is disconnected")
+                if not kalshi_ws:
+                    logger.warning("Kalshi WebSocket is NOT healthy (no data received)")
+                if not poly_rest:
+                    logger.warning("Polymarket REST client is disconnected")
+                if not poly_ws:
+                    logger.warning("Polymarket WebSocket is disconnected")
+
+                # Log summary
+                logger.debug(
+                    f"Health: Kalshi REST={kalshi_rest} WS={kalshi_ws}, "
+                    f"Poly REST={poly_rest} WS={poly_ws}"
+                )
 
             except asyncio.CancelledError:
                 break
@@ -422,6 +439,12 @@ class BotSupervisor:
             try:
                 await asyncio.sleep(30)  # Display every 30 seconds
 
+                # Get detailed connection status
+                kalshi_rest = self.kalshi_client.is_connected if self.kalshi_client else False
+                kalshi_ws = self.kalshi_client.ws_healthy if self.kalshi_client else False
+                poly_rest = self.polymarket_client.is_connected if self.polymarket_client else False
+                poly_ws = self.polymarket_client.is_connected if self.polymarket_client else False
+
                 status = (
                     f"\n{'='*80}\n"
                     f"Bot Status - Uptime: {self.metrics.uptime_str()}\n"
@@ -430,8 +453,8 @@ class BotSupervisor:
                     f"Opportunities Detected: {self.metrics.opportunities_detected}\n"
                     f"Trades Simulated: {self.metrics.trades_simulated}\n"
                     f"Total Simulated Profit: ${self.metrics.total_simulated_profit:.2f}\n"
-                    f"Kalshi Connected: {'✓' if self.metrics.kalshi_connected else '✗'}\n"
-                    f"Polymarket Connected: {'✓' if self.metrics.polymarket_connected else '✗'}\n"
+                    f"Kalshi REST: {'✓' if kalshi_rest else '✗'} | WS: {'✓' if kalshi_ws else '✗'}\n"
+                    f"Polymarket REST: {'✓' if poly_rest else '✗'} | WS: {'✓' if poly_ws else '✗'}\n"
                 )
 
                 if self.metrics.last_error:

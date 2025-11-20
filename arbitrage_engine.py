@@ -262,6 +262,13 @@ class ArbitrageEngine:
         opportunities = []
 
         try:
+            num_pairs = len(self.market_discovery.market_pairs)
+            if num_pairs == 0:
+                logger.warning("No market pairs available for cross-platform arbitrage scan")
+                return opportunities
+
+            logger.debug(f"Scanning {num_pairs} cross-platform market pairs...")
+
             # Iterate through all market pairs
             for pair in self.market_discovery.market_pairs:
                 try:
@@ -278,12 +285,18 @@ class ArbitrageEngine:
                         Platform.POLYMARKET, poly_market.market_id, Outcome.YES
                     )
 
-                    # Skip if we don't have complete data
-                    if None in [kalshi_yes_bid, kalshi_yes_ask, poly_yes_bid, poly_yes_ask]:
+                    # Skip if we don't have complete data - log which platform is missing
+                    has_kalshi = kalshi_yes_bid is not None and kalshi_yes_ask is not None
+                    has_poly = poly_yes_bid is not None and poly_yes_ask is not None
+
+                    if not has_kalshi or not has_poly:
                         self.scan_stats['markets_skipped_no_data'] += 1
-                        logger.debug(
+                        # Log at INFO level for visibility when debugging
+                        logger.info(
                             f"Skipped cross-platform pair {kalshi_market.market_id}/{poly_market.market_id}: "
-                            f"Missing price data"
+                            f"has_kalshi={has_kalshi}, has_poly={has_poly} "
+                            f"(K_bid={kalshi_yes_bid}, K_ask={kalshi_yes_ask}, "
+                            f"P_bid={poly_yes_bid}, P_ask={poly_yes_ask})"
                         )
                         continue
 
