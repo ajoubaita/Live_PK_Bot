@@ -55,6 +55,65 @@ class ArbitrageEngine:
             'last_summary_time': datetime.utcnow()
         }
 
+        # Profitability tracking
+        self.session_stats = {
+            'total_opportunities': 0,
+            'total_potential_profit': 0.0,
+            'best_opportunity_profit': 0.0,
+            'best_opportunity_return_pct': 0.0,
+            'opportunities_by_type': {'intra-platform': 0, 'cross-platform': 0},
+            'session_start': datetime.utcnow()
+        }
+
+    def _log_opportunity_details(self, opportunity: ArbitrageOpportunity):
+        """Log detailed information about a detected opportunity for profitability analysis."""
+        # Update session stats
+        self.session_stats['total_opportunities'] += 1
+        self.session_stats['total_potential_profit'] += opportunity.expected_profit
+        self.session_stats['opportunities_by_type'][opportunity.opportunity_type] += 1
+
+        if opportunity.expected_profit > self.session_stats['best_opportunity_profit']:
+            self.session_stats['best_opportunity_profit'] = opportunity.expected_profit
+            self.session_stats['best_opportunity_return_pct'] = opportunity.expected_return_pct
+
+        # Log detailed trade information
+        if opportunity.opportunity_type == 'intra-platform':
+            market_name = opportunity.single_market.title[:50] if opportunity.single_market else 'Unknown'
+            logger.info(
+                f"\n{'='*60}\n"
+                f"💰 ARBITRAGE OPPORTUNITY DETECTED\n"
+                f"{'='*60}\n"
+                f"Type: {opportunity.opportunity_type.upper()}\n"
+                f"Platform: {opportunity.buy_platform.value}\n"
+                f"Market: {market_name}\n"
+                f"Strategy: Buy YES@${opportunity.buy_price:.4f} + NO@${opportunity.sell_price:.4f}\n"
+                f"Total Cost: ${opportunity.buy_price + opportunity.sell_price:.4f}\n"
+                f"Trade Size: {opportunity.buy_size} contracts\n"
+                f"Expected Profit: ${opportunity.expected_profit:.2f}\n"
+                f"Return: {opportunity.expected_return_pct:.2f}%\n"
+                f"Time: {opportunity.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"{'='*60}"
+            )
+        else:  # cross-platform
+            kalshi_name = opportunity.market_pair.kalshi_market.title[:40] if opportunity.market_pair else 'Unknown'
+            poly_name = opportunity.market_pair.polymarket_market.title[:40] if opportunity.market_pair else 'Unknown'
+            logger.info(
+                f"\n{'='*60}\n"
+                f"💰 ARBITRAGE OPPORTUNITY DETECTED\n"
+                f"{'='*60}\n"
+                f"Type: {opportunity.opportunity_type.upper()}\n"
+                f"Buy: {opportunity.buy_platform.value} @ ${opportunity.buy_price:.4f}\n"
+                f"  Market: {kalshi_name if opportunity.buy_platform == Platform.KALSHI else poly_name}\n"
+                f"Sell: {opportunity.sell_platform.value} @ ${opportunity.sell_price:.4f}\n"
+                f"  Market: {poly_name if opportunity.sell_platform == Platform.POLYMARKET else kalshi_name}\n"
+                f"Spread: ${opportunity.sell_price - opportunity.buy_price:.4f}\n"
+                f"Trade Size: {opportunity.buy_size} contracts\n"
+                f"Expected Profit: ${opportunity.expected_profit:.2f}\n"
+                f"Return: {opportunity.expected_return_pct:.2f}%\n"
+                f"Time: {opportunity.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"{'='*60}"
+            )
+
     def _log_scan_summary(self):
         """Log periodic summary of scan statistics."""
         now = datetime.utcnow()
@@ -62,16 +121,33 @@ class ArbitrageEngine:
 
         # Log summary every 5 minutes
         if elapsed >= 300:
+            # Calculate session duration
+            session_duration = (now - self.session_stats['session_start']).total_seconds()
+            hours = int(session_duration // 3600)
+            minutes = int((session_duration % 3600) // 60)
+
             logger.info(
-                f"Arbitrage Scan Summary (last 5min): "
-                f"Markets checked: {self.scan_stats['markets_checked']}, "
-                f"Skipped (no data): {self.scan_stats['markets_skipped_no_data']}, "
-                f"Skipped (low spread): {self.scan_stats['markets_skipped_low_spread']}, "
-                f"Skipped (no size): {self.scan_stats['markets_skipped_no_size']}, "
-                f"Opportunities found: {self.metrics.opportunities_detected}"
+                f"\n{'='*60}\n"
+                f"📊 ARBITRAGE SCAN SUMMARY (last 5 minutes)\n"
+                f"{'='*60}\n"
+                f"Markets checked: {self.scan_stats['markets_checked']}\n"
+                f"Skipped (no data): {self.scan_stats['markets_skipped_no_data']}\n"
+                f"Skipped (low spread): {self.scan_stats['markets_skipped_low_spread']}\n"
+                f"Skipped (no size): {self.scan_stats['markets_skipped_no_size']}\n"
+                f"Opportunities found this period: {self.metrics.opportunities_detected}\n"
+                f"{'='*60}\n"
+                f"📈 SESSION PROFITABILITY (running {hours}h {minutes}m)\n"
+                f"{'='*60}\n"
+                f"Total opportunities: {self.session_stats['total_opportunities']}\n"
+                f"  - Intra-platform: {self.session_stats['opportunities_by_type']['intra-platform']}\n"
+                f"  - Cross-platform: {self.session_stats['opportunities_by_type']['cross-platform']}\n"
+                f"Total potential profit: ${self.session_stats['total_potential_profit']:.2f}\n"
+                f"Best single opportunity: ${self.session_stats['best_opportunity_profit']:.2f} ({self.session_stats['best_opportunity_return_pct']:.2f}%)\n"
+                f"Avg profit per opportunity: ${self.session_stats['total_potential_profit'] / max(1, self.session_stats['total_opportunities']):.2f}\n"
+                f"{'='*60}"
             )
 
-            # Reset stats
+            # Reset scan stats (but not session stats)
             self.scan_stats = {
                 'markets_checked': 0,
                 'markets_skipped_no_data': 0,
@@ -224,11 +300,8 @@ class ArbitrageEngine:
 
                             opportunities.append(opportunity)
 
-                            logger.info(
-                                f"Intra-platform arbitrage on {platform.value}/{market_id}: "
-                                f"Buy YES@{yes_ask:.4f} + NO@{no_ask:.4f} = {total_cost:.4f}, "
-                                f"Profit: ${expected_profit * trade_size:.2f}"
-                            )
+                            # Log detailed opportunity for profitability tracking
+                            self._log_opportunity_details(opportunity)
                         else:
                             # Spread too low
                             self.scan_stats['markets_skipped_low_spread'] += 1
@@ -342,12 +415,8 @@ class ArbitrageEngine:
 
                                 opportunities.append(opportunity)
 
-                                logger.info(
-                                    f"Cross-platform arbitrage: "
-                                    f"Buy Kalshi YES@{kalshi_yes_ask:.4f}, "
-                                    f"Sell Polymarket YES@{poly_yes_bid:.4f}, "
-                                    f"Profit: ${spread * trade_size:.2f}"
-                                )
+                                # Log detailed opportunity for profitability tracking
+                                self._log_opportunity_details(opportunity)
                             else:
                                 # No available size
                                 self.scan_stats['markets_skipped_no_size'] += 1
@@ -406,12 +475,8 @@ class ArbitrageEngine:
 
                                 opportunities.append(opportunity)
 
-                                logger.info(
-                                    f"Cross-platform arbitrage: "
-                                    f"Buy Polymarket YES@{poly_yes_ask:.4f}, "
-                                    f"Sell Kalshi YES@{kalshi_yes_bid:.4f}, "
-                                    f"Profit: ${spread * trade_size:.2f}"
-                                )
+                                # Log detailed opportunity for profitability tracking
+                                self._log_opportunity_details(opportunity)
                             else:
                                 # No available size
                                 self.scan_stats['markets_skipped_no_size'] += 1

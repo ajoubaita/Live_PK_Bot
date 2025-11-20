@@ -25,9 +25,10 @@ nano .env  # Add your API keys
 
 - **Real-Time WebSocket Feeds**: Low-latency market data from both exchanges
 - **Dual Arbitrage Detection**: Intra-platform (YES + NO < $1.00) and cross-platform opportunities
+- **Smart Market Pairing**: Category-based matching with time-horizon alignment
+- **Profitability Tracking**: Detailed per-trade logging with session profit summaries
 - **Auto-Recovery**: Exponential backoff reconnection with circuit breakers
 - **Rate Limiting**: Respects all API limits (burst + sustained windows)
-- **Subscription Rotation**: Efficiently handles 1000+ markets
 - **Comprehensive Logging**: Debug, info, and error tracking with 5-minute summaries
 - **24/7 Operation**: Cloud-ready with tmux/systemd support
 
@@ -132,7 +133,7 @@ Opportunities found: 2
 | `kalshi_client.py` | Kalshi API/WebSocket with API key auth |
 | `polymarket_client.py` | Polymarket API/WebSocket with rotation |
 | `arbitrage_engine.py` | Opportunity detection with fee calculation |
-| `market_discovery.py` | Fuzzy market pairing |
+| `market_discovery.py` | Category-based market pairing with time-horizon alignment |
 | `orderbook_manager.py` | Real-time order book tracking |
 | `trade_logger.py` | SQLite + JSON Lines persistence |
 | `utils.py` | Rate limiting (dual-window), circuit breakers |
@@ -143,6 +144,74 @@ Opportunities found: 2
 WebSocket → Order Book → Arbitrage Engine → Trade Logger
                 ↓
          Market Discovery
+```
+
+### Market Discovery Algorithm
+
+The bot uses a sophisticated category-based pairing algorithm to find equivalent markets across exchanges:
+
+**Algorithm Steps:**
+1. **Category Detection**: Classify markets into SPORTS, POLITICS, MACRO_ECON, CRYPTO, ENTERTAINMENT, WEATHER, OTHER
+2. **Time-Horizon Grouping**: Extract resolution dates and group markets by close time
+3. **Pre-filtering**: Only compare markets in the SAME category with compatible time horizons
+4. **Token Normalization**: Strip noise (player names, stat thresholds) before fuzzy matching
+5. **Multi-Component Scoring**: `final_score = text_similarity × category_score × time_score`
+
+**Tunable Constants** (`market_discovery.py`):
+```python
+MIN_FINAL_SCORE = 0.55              # Minimum score to accept pair
+MIN_TEXT_SIMILARITY = 0.35          # Minimum text match
+MAX_RESOLUTION_DIFF_DAYS = 45       # Max days apart for resolution
+IDEAL_RESOLUTION_DIFF_DAYS = 7      # Full score within this range
+```
+
+**Why Category-Based?**
+- Eliminates garbage matches (NFL props → Fed rate cuts)
+- Sports markets stay with sports, politics with politics
+- Time alignment ensures markets resolve in similar windows
+
+### Profitability Tracking
+
+The arbitrage engine provides comprehensive logging for profitability analysis:
+
+**Per-Opportunity Logging:**
+```
+============================================================
+💰 ARBITRAGE OPPORTUNITY DETECTED
+============================================================
+Type: CROSS-PLATFORM
+Buy: kalshi @ $0.4500
+  Market: Will Fed cut rates in Dec 2025?
+Sell: polymarket @ $0.4800
+  Market: Fed rate cut December 2025
+Spread: $0.0300
+Trade Size: 100 contracts
+Expected Profit: $3.00
+Return: 6.67%
+Time: 2024-11-20 15:30:45 UTC
+============================================================
+```
+
+**Session Summary (every 5 minutes):**
+```
+============================================================
+📊 ARBITRAGE SCAN SUMMARY (last 5 minutes)
+============================================================
+Markets checked: 1500
+Skipped (no data): 400
+Skipped (low spread): 1050
+Skipped (no size): 50
+Opportunities found this period: 3
+============================================================
+📈 SESSION PROFITABILITY (running 2h 30m)
+============================================================
+Total opportunities: 15
+  - Intra-platform: 8
+  - Cross-platform: 7
+Total potential profit: $45.50
+Best single opportunity: $5.20 (8.50%)
+Avg profit per opportunity: $3.03
+============================================================
 ```
 
 ---
@@ -864,6 +933,12 @@ See **DEPLOYMENT_INSTRUCTIONS.md** for complete deployment steps including:
 
 ## 📝 Version History
 
+- **1.1.0** (Nov 2024): Market discovery rewrite with category-based pairing
+  - Category detection (SPORTS, POLITICS, MACRO_ECON, CRYPTO, etc.)
+  - Time-horizon alignment for resolution dates
+  - Multi-component scoring pipeline
+  - Enhanced profitability logging with session summaries
+  - Detailed per-opportunity trade logging
 - **1.0.0** (Nov 2024): Production release with critical WebSocket and auth fixes
 
 ## 📧 Support
