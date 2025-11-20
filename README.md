@@ -414,25 +414,43 @@ while not ws.closed:
 reconnect_delay = min(reconnect_delay * 2, 60)
 ```
 
-#### Subscription Batching
+#### Dynamic Subscription Management
 
-**Polymarket Batch Subscriptions** (`polymarket_client.py:395-483`):
+**⚠️ IMPORTANT: The rotation-based approach has been deprecated.**
+
+The bot now uses **persistent connections** with **in-place subscription updates**:
+
 ```python
-# 20 markets per batch
-batch_size = 20
+# Startup: Subscribe to ALL markets in single message
+subscribe_msg = {
+    "assets_ids": all_token_ids,  # Can be 1000+ markets
+    "type": "market"
+}
 
-# Wait between batches
-await asyncio.sleep(2.0)  # After each batch for confirmations
-await asyncio.sleep(1.0)  # Between batches
+# Runtime: Add new markets without reconnecting
+async def subscribe_to_market(self, asset_id: str):
+    if asset_id not in self.subscribed_assets:
+        await ws.send(json.dumps({
+            "assets_ids": [asset_id],
+            "type": "market"
+        }))
+        self.subscribed_assets.add(asset_id)
 
-# Rotation interval
-rotation_interval = 300  # 5 minutes
+# Runtime: Remove closed markets without reconnecting
+async def unsubscribe_from_market(self, asset_id: str):
+    if asset_id in self.subscribed_assets:
+        await ws.send(json.dumps({
+            "assets_ids": [asset_id],
+            "type": "unsubscribe"
+        }))
+        self.subscribed_assets.discard(asset_id)
 ```
 
-**Subscription Groups**:
-- Markets split into groups of 20
-- Rotates to next group every 5 minutes
-- Unsubscribes from current before subscribing to next
+**Why No Rotation?**
+- Polymarket supports **65,000+ subscriptions** per connection
+- Rotation causes unnecessary reconnects and data gaps
+- Dynamic add/remove is more efficient and reliable
+- Eliminates Cloudflare throttling from connection churn
 
 ---
 
@@ -575,9 +593,10 @@ elif isinstance(best_bid, dict):
    - Kalshi: Connect with auth headers
    - Polymarket: Connect (no auth), wait 2s handshake
 7. **Subscribe to Markets**
-   - Kalshi: All markets in single subscription
-   - Polymarket: Batched (20/batch, 1-2s between batches)
-8. **Start Arbitrage Scanning** (10 Hz)
+   - Kalshi: All markets in single subscription message
+   - Polymarket: All markets in single subscription message
+8. **Wait for Initial Data** (~2-5 seconds)
+9. **Start Arbitrage Scanning** (10 Hz)
 
 #### Runtime Loop
 
@@ -585,19 +604,25 @@ elif isinstance(best_bid, dict):
 Every 0.1s:  Scan orderbooks for arbitrage opportunities
 Every 15s:   WebSocket keepalive (ping/pong)
 Every 30s:   Check for stale orderbook data
-Every 5min:  Rotate Polymarket subscriptions
+Every 5min:  Refresh market lists from REST APIs
+Every 5min:  Update subscriptions in-place (add new, remove closed)
 Every 5min:  Print scan summary
 ```
+
+**Note**: No reconnection or rotation occurs during normal operation. Subscriptions are updated dynamically without interrupting the WebSocket connection.
 
 ## 🔧 Advanced Settings
 
 ### WebSocket Performance
 
-- **Handshake wait**: 2 seconds (prevents "no close frame" errors)
-- **Subscription throttle**: 1 second per market
-- **Group size**: 20 markets per subscription group
-- **Rotation**: Every 5 minutes
-- **Keepalive**: 15-second ping/pong
+- **Handshake wait**: 1-2 seconds (connection stabilization)
+- **Subscription**: Single message with all markets (no batching/rotation)
+- **Max subscriptions**: 65,000 per Polymarket connection
+- **Keepalive**:
+  - Kalshi: 15-second ping/pong
+  - Polymarket: 30-second ping/pong (recommended)
+- **Reconnect strategy**: Exponential backoff (2s → 60s cap)
+- **Connection persistence**: Maintain single connection, update subscriptions in-place
 
 ### Rate Limits
 
@@ -617,15 +642,130 @@ polymarket_fee = 0.02 # 2%
 profit = sell_price * (1 - sell_fee) - buy_price * (1 + buy_fee)
 ```
 
+## 🔴 Known Issues & Recommended Fixes
+
+### Critical Architecture Issues
+
+The current implementation has several issues that cause WebSocket instability:
+
+#### 1. Subscription Rotation (DEPRECATED)
+
+**Location**: `polymarket_client.py:526-570`
+
+**Problem**: The bot rotates through 20-market batches every 5 minutes, causing:
+- Unnecessary WebSocket reconnects
+- Data gaps during rotation
+- Cloudflare throttling from connection churn
+
+**Fix Required**:
+```python
+# REMOVE these from polymarket_client.py:
+- _rotation_task method
+- subscription_groups logic
+- rotation_interval usage
+
+# ADD instead:
+async def update_subscriptions(self, new_market_ids: List[str]):
+    """Update subscriptions in-place without reconnecting."""
+    new_set = set(new_market_ids)
+    to_subscribe = new_set - self.subscribed_assets
+    to_unsubscribe = self.subscribed_assets - new_set
+    # Subscribe/unsubscribe in-place
+```
+
+#### 2. Market Refresh Doesn't Update Subscriptions
+
+**Location**: `supervisor.py:325-342`
+
+**Problem**: `_market_refresh_loop` calls `refresh_markets()` but never updates WebSocket subscriptions. New markets discovered after startup are never subscribed to.
+
+**Fix Required**:
+```python
+async def _market_refresh_loop(self):
+    while self.running:
+        await asyncio.sleep(self.config.market_refresh_interval)
+        await self.market_discovery.refresh_markets()
+
+        # ADD: Update subscriptions dynamically
+        new_poly_ids = [m.metadata.get('token_id')
+                       for m in self.market_discovery.polymarket_markets.values()]
+        await self.polymarket_client.update_subscriptions(new_poly_ids)
+
+        new_kalshi_ids = list(self.market_discovery.kalshi_markets.keys())
+        await self.kalshi_client.update_subscriptions(new_kalshi_ids)
+```
+
+#### 3. Kalshi Auth Flow Creates Retry Loops
+
+**Location**: `kalshi_client.py:96-133`
+
+**Problem**: Bot tries email/password login first, gets 401, then falls back to API key. This creates unnecessary auth churn.
+
+**Fix Required**:
+```python
+# Skip email/password entirely - use API key only
+async def _authenticate(self):
+    if self.config.kalshi_api_key:
+        logger.info("Using Kalshi API key authentication")
+        return  # API key used in headers
+    else:
+        raise ValueError("KALSHI_API_KEY required")
+```
+
+#### 4. Incorrect Ping Interval for Polymarket
+
+**Location**: `polymarket_client.py:593-597`
+
+**Problem**: Uses 15-second ping interval, but Polymarket prefers 30 seconds.
+
+**Fix Required**:
+```python
+async with websockets.connect(
+    self.ws_url,
+    ping_interval=30,  # Changed from 15
+    ping_timeout=10
+) as ws:
+```
+
+#### 5. Config Access Pattern Issue
+
+**Location**: `supervisor.py:188`
+
+**Problem**: Uses `self.config.__dict__.get()` which is fragile.
+
+**Fix Required**:
+```python
+# Change from:
+max_markets = self.config.__dict__.get('max_markets_per_platform', 50)
+
+# To:
+max_markets = getattr(self.config, 'max_markets_per_platform', 50)
+```
+
+### Recommended Architecture Changes
+
+1. **Single persistent connection** per platform (no rotation)
+2. **Subscribe to ALL markets** at startup in single message
+3. **Dynamic add/remove** subscriptions when markets change
+4. **Skip deprecated auth** methods (use API key only for Kalshi)
+5. **Update ping interval** to 30s for Polymarket
+
+---
+
 ## 🐛 Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
 | `ModuleNotFoundError: pydantic_settings` | Run `./startup.sh --install` |
-| WebSocket disconnects after 2 markets | Fixed - handshake wait now implemented |
-| Kalshi 404/401 errors | Fixed - uses API key auth, not deprecated login |
+| WebSocket disconnects frequently | Check for rotation code (should be removed); verify ping intervals |
+| Kalshi 401 errors | Verify KALSHI_API_KEY is set; don't use email/password |
+| Polymarket no data received | Ensure token IDs are valid; check subscription message format |
 | 0 market pairs found | Lower MARKET_SIMILARITY_THRESHOLD to 0.4-0.5 |
 | High CPU usage | Verify UPDATE_INTERVAL=0.1 in .env |
+| Cloudflare blocking | Reduce reconnection frequency; use persistent connections |
+| Stale orderbook data | Check WebSocket connection health; verify keepalive timing |
+| Memory growing over time | Ensure closed markets are unsubscribed and removed from tracking |
+| New markets not receiving data | Implement dynamic subscription updates (see Issue #2 above) |
 
 ### Debug Mode
 
@@ -667,9 +807,10 @@ grep "arbitrage" /var/log/arbitrage-bot/trading_bot.log | tail -20
 
 ### Timing
 
-- **Initial subscription**: ~24 minutes (1302 markets at 1s/market)
+- **Initial subscription**: ~2-5 seconds (all markets in single message)
 - **Scan frequency**: 10 Hz (0.1s interval)
-- **Market refresh**: Every 5 minutes
+- **Market refresh**: Every 5 minutes (REST API calls)
+- **Subscription updates**: In-place, ~100ms per add/remove
 - **Reconnect backoff**: 2s → 60s exponential cap
 
 ## 🔐 Security
